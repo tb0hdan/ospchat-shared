@@ -1,0 +1,83 @@
+name: Release
+
+# On tag push (e.g. `v0.1.0`): re-verify ktlint + tests, publish to GitHub
+# Packages Maven repository, and create a GitHub Release with the JAR + AAR
+# attached for direct download.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  # Needed for publishing to GitHub Packages (Maven) below.
+  packages: write
+
+jobs:
+  release:
+    name: ktlint + publish + GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Gradle 8.10.2
+        run: |
+          set -euo pipefail
+          curl -sSLo /tmp/gradle.zip \
+            https://services.gradle.org/distributions/gradle-8.10.2-bin.zip
+          sudo unzip -q /tmp/gradle.zip -d /opt
+          echo "/opt/gradle-8.10.2/bin" >> "$GITHUB_PATH"
+          /opt/gradle-8.10.2/bin/gradle --version
+
+      - name: Install ktlint 1.8.0
+        run: |
+          set -euo pipefail
+          curl -sSLo /tmp/ktlint \
+            https://github.com/pinterest/ktlint/releases/download/1.8.0/ktlint
+          chmod +x /tmp/ktlint
+          sudo mv /tmp/ktlint /usr/local/bin/ktlint
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0'
+
+      - name: ktlint
+        run: make ktlint
+
+      - name: Build (compile + tests)
+        env:
+          GRADLE: gradle
+        run: make build
+
+      - name: Publish to GitHub Packages (Maven)
+        env:
+          GRADLE: gradle
+          ORG_GRADLE_PROJECT_gprUser: ${{ github.actor }}
+          ORG_GRADLE_PROJECT_gprToken: ${{ secrets.GITHUB_TOKEN }}
+        run: gradle publish --no-daemon
+
+      - name: Collect release artifacts
+        # Pull every produced JAR / AAR / module file into a flat dist/
+        # directory we can attach to the Release.
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find build/libs build/outputs/aar -type f \
+            \( -name '*.jar' -o -name '*.aar' -o -name '*.module' \) \
+            -exec cp -v {} dist/ \; 2>/dev/null || true
+          ls -lR dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
