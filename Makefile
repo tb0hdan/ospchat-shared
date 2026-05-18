@@ -30,3 +30,8 @@ publish-local: ## Publish to ~/.m2/repository so ospchat-desktop can consume.
 
 clean: ## gradle clean
 	$(GRADLE) clean
+
+tag:
+	@echo "Tagging the current version..."
+	git tag -a "v$(VERSION)" -m "Release version $(VERSION)"; \
+	git push origin "v$(VERSION)"
