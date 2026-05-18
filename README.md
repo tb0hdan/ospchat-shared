@@ -1,7 +1,7 @@
 # OSPChat — Shared (Kotlin Multiplatform)
 
-Shared Kotlin code consumed by both [`ospchat-android`](github.com/tb0hdan/ospchat-android)
-and [`ospchat-desktop`](github.com/tb0hdan/ospchat-desktop). DTOs, wire protocol, domain
+Shared Kotlin code consumed by both [`ospchat-android`](https://github.com/tb0hdan/ospchat-android)
+and [`ospchat-desktop`](https://github.com/tb0hdan/ospchat-desktop). DTOs, wire protocol, domain
 use cases, Room data layer, identity, peer-discovery service, attachment
 abstractions — everything that isn't platform-specific lives here.
 
