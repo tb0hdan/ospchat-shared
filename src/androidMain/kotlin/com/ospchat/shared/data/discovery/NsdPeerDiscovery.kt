@@ -95,10 +95,15 @@ class NsdPeerDiscovery(
     }
 
     /**
-     * Drop our cached resolution for [uuid] and bounce discovery so the
-     * framework re-emits onServiceFound (and we re-resolve, picking up any
-     * port change the peer made on restart). NSD framework caching means
-     * we can't just "re-resolve uuid X" — we have to restart discovery.
+     * Drop the cached resolution for [uuid] and ask NSD to re-resolve just
+     * that peer's service name. Stays surgical: we never call
+     * `stopServiceDiscovery` because that fires `onServiceLost` for *every*
+     * peer the framework is currently tracking — which empties `_peers`,
+     * looks like a snapshot churn to downstream consumers (peer-sync jobs
+     * see every peer as "newly arrived"), and combined with any sync HTTP
+     * call failing creates a global re-entry loop. By going through the
+     * existing per-service resolve queue we only invalidate the one entry
+     * we asked about.
      */
     @Synchronized
     override fun forgetPeer(uuid: String) {
@@ -106,18 +111,21 @@ class NsdPeerDiscovery(
         // Drop both the reverse lookup and the live snapshot entry first so
         // the UI immediately reflects "offline until re-resolved".
         val staleNames = nameToUuid.entries.filter { it.value == uuid }.map { it.key }
+        if (staleNames.isEmpty()) return
         staleNames.forEach { nameToUuid.remove(it) }
         _peers.update { it - uuid }
 
-        // Bounce discovery so the framework re-emits onServiceFound for all
-        // peers, including the one that just restarted on a new port.
-        val oldListener = discoveryListener ?: return
-        runCatching { nsdManager.stopServiceDiscovery(oldListener) }
-        val newListener = buildDiscoveryListener()
-        discoveryListener = newListener
-        runCatching {
-            nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, newListener)
-        }.onFailure { Log.w(TAG, "discoverServices restart failed", it) }
+        // Build a stub NsdServiceInfo (resolveService only needs name + type)
+        // and feed it through the existing resolve serialiser. handleResolved
+        // will repopulate `_peers` with whatever SRV/TXT NSD returns.
+        staleNames.forEach { name ->
+            val stub =
+                NsdServiceInfo().apply {
+                    serviceName = name
+                    serviceType = SERVICE_TYPE
+                }
+            enqueueResolve(stub)
+        }
     }
 
     private fun buildRegistrationListener() =

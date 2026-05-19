@@ -82,6 +82,7 @@ class MessageClient(
     suspend fun syncGroups(
         peer: Peer,
         request: GroupSyncRequestDto,
+        rediscover: Boolean = true,
     ): GroupSyncResponseDto {
         var effective = peer
         var retried = false
@@ -97,7 +98,7 @@ class MessageClient(
                 }
                 return response.body()
             } catch (t: Throwable) {
-                effective = rediscoverOrThrow(peer, effective, retried, t)
+                effective = rediscoverOrThrow(peer, effective, retried, t, rediscover)
                 retried = true
             }
         }
@@ -108,7 +109,10 @@ class MessageClient(
      * pick up nickname / avatarHash changes. Body is empty; the caller is
      * identified on the receiver side by source IP.
      */
-    suspend fun notifyRefresh(peer: Peer) {
+    suspend fun notifyRefresh(
+        peer: Peer,
+        rediscover: Boolean = true,
+    ) {
         var effective = peer
         var retried = false
         while (true) {
@@ -120,7 +124,7 @@ class MessageClient(
                 }
                 return
             } catch (t: Throwable) {
-                effective = rediscoverOrThrow(peer, effective, retried, t)
+                effective = rediscoverOrThrow(peer, effective, retried, t, rediscover)
                 retried = true
             }
         }
@@ -130,9 +134,13 @@ class MessageClient(
     suspend fun fetchAttachment(
         peer: Peer,
         messageId: String,
-    ): ByteArray = bytesFromPeer(peer, "/v1/attachments/$messageId")
+        rediscover: Boolean = true,
+    ): ByteArray = bytesFromPeer(peer, "/v1/attachments/$messageId", rediscover)
 
-    suspend fun getInfo(peer: Peer): InfoDto {
+    suspend fun getInfo(
+        peer: Peer,
+        rediscover: Boolean = true,
+    ): InfoDto {
         var effective = peer
         var retried = false
         while (true) {
@@ -143,18 +151,22 @@ class MessageClient(
                 }
                 return response.body()
             } catch (t: Throwable) {
-                effective = rediscoverOrThrow(peer, effective, retried, t)
+                effective = rediscoverOrThrow(peer, effective, retried, t, rediscover)
                 retried = true
             }
         }
     }
 
     /** Fetch the peer's custom avatar bytes; throws on 4xx/5xx. */
-    suspend fun fetchAvatar(peer: Peer): ByteArray = bytesFromPeer(peer, "/v1/avatar")
+    suspend fun fetchAvatar(
+        peer: Peer,
+        rediscover: Boolean = true,
+    ): ByteArray = bytesFromPeer(peer, "/v1/avatar", rediscover)
 
     private suspend fun bytesFromPeer(
         peer: Peer,
         path: String,
+        rediscover: Boolean,
     ): ByteArray {
         var effective = peer
         var retried = false
@@ -166,7 +178,7 @@ class MessageClient(
                 }
                 return response.readBytes()
             } catch (t: Throwable) {
-                effective = rediscoverOrThrow(peer, effective, retried, t)
+                effective = rediscoverOrThrow(peer, effective, retried, t, rediscover)
                 retried = true
             }
         }
@@ -176,6 +188,7 @@ class MessageClient(
         peer: Peer,
         path: String,
         body: T,
+        rediscover: Boolean = true,
     ) {
         var effective = peer
         var retried = false
@@ -191,7 +204,7 @@ class MessageClient(
                 }
                 return
             } catch (t: Throwable) {
-                effective = rediscoverOrThrow(peer, effective, retried, t)
+                effective = rediscoverOrThrow(peer, effective, retried, t, rediscover)
                 retried = true
             }
         }
@@ -202,15 +215,25 @@ class MessageClient(
      * restarted on a fresh port and the cached mDNS resolution is stale),
      * tell discovery to forget+re-resolve the peer's uuid and return the
      * freshly-resolved [Peer] to retry against. Re-throws if discovery is
-     * unavailable, the failure isn't a connection error, we already
-     * retried, or no fresh resolution arrives in time.
+     * unavailable, the failure isn't a connection error, the caller opted
+     * out of the rediscover path, we already retried, or no fresh
+     * resolution arrives in time.
+     *
+     * [rediscover] is the per-call opt-out: background flows that already
+     * own their own retry/backoff (avatar sync, group sync, info refresh
+     * notifies, attachment download) pass `false` so a failed call does
+     * not mutate the discovery snapshot. Mutating it from background flows
+     * starves user-initiated sends and — combined with `PeerSyncJob`'s
+     * "snapshot delta" → re-fire sync logic — creates a feedback loop.
      */
     private suspend fun rediscoverOrThrow(
         original: Peer,
         attempted: Peer,
         alreadyRetried: Boolean,
         cause: Throwable,
+        rediscover: Boolean,
     ): Peer {
+        if (!rediscover) throw cause
         val discovery = discoveryRepository ?: throw cause
         if (alreadyRetried) throw cause
         if (!isConnectFailure(cause)) throw cause

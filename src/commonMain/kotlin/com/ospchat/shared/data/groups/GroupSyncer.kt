@@ -43,7 +43,7 @@ class GroupSyncer(
         if (cursors.isEmpty()) return
         val request = GroupSyncRequestDto(fromUuid = selfUuid, cursors = cursors)
         val response: GroupSyncResponseDto =
-            runCatching { client.syncGroups(peer, request) }
+            runCatching { client.syncGroups(peer, request, rediscover = false) }
                 .getOrElse {
                     Log.w(TAG, "sync request to ${peer.uuid} failed", it)
                     return

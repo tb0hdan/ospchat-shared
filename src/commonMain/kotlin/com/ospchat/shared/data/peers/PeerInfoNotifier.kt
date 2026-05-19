@@ -33,7 +33,7 @@ class PeerInfoNotifier(
         val peers = discoveryRepository.peerSnapshot.value.values
         for (peer in peers) {
             scope.launch {
-                runCatching { client.notifyRefresh(peer) }
+                runCatching { client.notifyRefresh(peer, rediscover = false) }
                     .onFailure { Log.w(TAG, "notifyRefresh to ${peer.uuid} failed", it) }
             }
         }

@@ -78,28 +78,25 @@ class JmDnsPeerDiscovery : PeerDiscoveryService {
     }
 
     /**
-     * Drop our cached resolution for [uuid] and ask JmDNS to re-query for
-     * any service of our type. The async `requestServiceInfo` per known
-     * name forces a fresh SRV/TXT pull; on hit, the listener overwrites
-     * our entry with the current port.
+     * Drop our cached resolution for [uuid] and ask JmDNS to re-query the
+     * peer's known service name. `requestServiceInfo` is async — the
+     * listener picks up the resulting `serviceResolved` event and rewrites
+     * `_peers` with whatever SRV/TXT JmDNS returns. We deliberately avoid
+     * `jm.list(SERVICE_TYPE)` here because it is blocking (up to ~6 s
+     * waiting on the JmDNS lookup) and forgetPeer runs from the
+     * MessageClient coroutine on a connection-failure path.
      */
     @Synchronized
     override fun forgetPeer(uuid: String) {
         val jm = jmdns ?: return
         val staleNames = nameToUuid.entries.filter { it.value == uuid }.map { it.key }
+        if (staleNames.isEmpty()) return
         staleNames.forEach { nameToUuid.remove(it) }
         _peers.update { it - uuid }
-        // Ask JmDNS to re-resolve every known service of our type. The hit
-        // we care about is the one that just restarted; for others it's a
-        // cheap no-op that may also refresh stale state.
         staleNames.forEach { name ->
             runCatching { jm.requestServiceInfo(SERVICE_TYPE, name, true) }
                 .onFailure { Log.w(TAG, "requestServiceInfo($name) failed", it) }
         }
-        // Also fire a broad re-query in case the peer's nickname (service
-        // name) has changed too — listServices triggers JmDNS to refresh.
-        runCatching { jm.list(SERVICE_TYPE) }
-            .onFailure { Log.w(TAG, "list($SERVICE_TYPE) failed", it) }
     }
 
     private fun buildListener(jm: JmDNS): ServiceListener =

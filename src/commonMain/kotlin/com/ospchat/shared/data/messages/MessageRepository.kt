@@ -153,7 +153,9 @@ class MessageRepository(
         messageId: String,
     ) {
         runCatching {
-            val bytes = client.fetchAttachment(fromPeer, messageId)
+            // Background download — own retry semantics; don't mutate the
+            // discovery snapshot on failure (see MessageClient.rediscover docs).
+            val bytes = client.fetchAttachment(fromPeer, messageId, rediscover = false)
             val path = attachmentStore.writeBytes(messageId, bytes)
             messageDao.updateAttachmentLocalPath(id = messageId, localPath = path)
         }.onFailure { Log.w(TAG, "Attachment download failed for $messageId", it) }

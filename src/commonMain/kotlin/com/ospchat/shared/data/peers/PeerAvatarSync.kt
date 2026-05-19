@@ -39,7 +39,15 @@ class PeerAvatarSync(
     }
 
     suspend fun sync(peer: Peer) {
-        val info = withRetry(label = "/v1/info", peerUuid = peer.uuid) { client.getInfo(peer) } ?: return
+        val info =
+            withRetry(label = "/v1/info", peerUuid = peer.uuid) {
+                // rediscover = false: this is a background flow with its
+                // own retry/backoff. Letting it mutate the discovery
+                // snapshot on failure would create a feedback loop with
+                // PeerSyncJob (which re-fires sync on every snapshot
+                // delta).
+                client.getInfo(peer, rediscover = false)
+            } ?: return
 
         val entity = peerDao.findByUuid(peer.uuid) ?: return
         val newHash = info.avatarHash
@@ -54,7 +62,7 @@ class PeerAvatarSync(
 
         val savedPath =
             withRetry(label = "/v1/avatar", peerUuid = peer.uuid) {
-                val bytes = client.fetchAvatar(peer)
+                val bytes = client.fetchAvatar(peer, rediscover = false)
                 avatarStore.writePeer(uuid = peer.uuid, hash = newHash, bytes = bytes)
             } ?: return
 
