@@ -24,4 +24,7 @@ class DiscoveryRepository(
     ) = discovery.start(nickname, uuid, port)
 
     fun stop() = discovery.stop()
+
+    /** Drop the cached resolution for [uuid] and trigger a re-resolve. */
+    fun forgetPeer(uuid: String) = discovery.forgetPeer(uuid)
 }

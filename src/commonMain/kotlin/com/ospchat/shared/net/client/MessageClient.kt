@@ -1,5 +1,6 @@
 package com.ospchat.shared.net.client
 
+import com.ospchat.shared.data.discovery.DiscoveryRepository
 import com.ospchat.shared.data.discovery.Peer
 import com.ospchat.shared.net.dto.GroupLeaveDto
 import com.ospchat.shared.net.dto.GroupMessagePostDto
@@ -20,6 +21,8 @@ import io.ktor.client.statement.readBytes
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
 import io.ktor.http.isSuccess
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Thin Ktor-based wrapper for peer HTTP calls. The underlying [HttpClient] is
@@ -32,6 +35,7 @@ import io.ktor.http.isSuccess
  */
 class MessageClient(
     private val http: HttpClient,
+    private val discoveryRepository: DiscoveryRepository? = null,
 ) {
     suspend fun send(
         peer: Peer,
@@ -79,15 +83,24 @@ class MessageClient(
         peer: Peer,
         request: GroupSyncRequestDto,
     ): GroupSyncResponseDto {
-        val response: HttpResponse =
-            http.post("http://${peer.host}:${peer.port}/v1/groups/sync") {
-                contentType(ContentType.Application.Json)
-                setBody(request)
+        var effective = peer
+        var retried = false
+        while (true) {
+            try {
+                val response: HttpResponse =
+                    http.post("http://${effective.host}:${effective.port}/v1/groups/sync") {
+                        contentType(ContentType.Application.Json)
+                        setBody(request)
+                    }
+                if (!response.status.isSuccess()) {
+                    error("Peer rejected /v1/groups/sync: HTTP ${response.status.value}")
+                }
+                return response.body()
+            } catch (t: Throwable) {
+                effective = rediscoverOrThrow(peer, effective, retried, t)
+                retried = true
             }
-        if (!response.status.isSuccess()) {
-            error("Peer rejected /v1/groups/sync: HTTP ${response.status.value}")
         }
-        return response.body()
     }
 
     /**
@@ -96,10 +109,20 @@ class MessageClient(
      * identified on the receiver side by source IP.
      */
     suspend fun notifyRefresh(peer: Peer) {
-        val response: HttpResponse =
-            http.post("http://${peer.host}:${peer.port}/v1/notify-refresh")
-        if (!response.status.isSuccess()) {
-            error("Peer rejected /v1/notify-refresh: HTTP ${response.status.value}")
+        var effective = peer
+        var retried = false
+        while (true) {
+            try {
+                val response: HttpResponse =
+                    http.post("http://${effective.host}:${effective.port}/v1/notify-refresh")
+                if (!response.status.isSuccess()) {
+                    error("Peer rejected /v1/notify-refresh: HTTP ${response.status.value}")
+                }
+                return
+            } catch (t: Throwable) {
+                effective = rediscoverOrThrow(peer, effective, retried, t)
+                retried = true
+            }
         }
     }
 
@@ -110,11 +133,20 @@ class MessageClient(
     ): ByteArray = bytesFromPeer(peer, "/v1/attachments/$messageId")
 
     suspend fun getInfo(peer: Peer): InfoDto {
-        val response: HttpResponse = http.get("http://${peer.host}:${peer.port}/v1/info")
-        if (!response.status.isSuccess()) {
-            error("Peer rejected /v1/info: HTTP ${response.status.value}")
+        var effective = peer
+        var retried = false
+        while (true) {
+            try {
+                val response: HttpResponse = http.get("http://${effective.host}:${effective.port}/v1/info")
+                if (!response.status.isSuccess()) {
+                    error("Peer rejected /v1/info: HTTP ${response.status.value}")
+                }
+                return response.body()
+            } catch (t: Throwable) {
+                effective = rediscoverOrThrow(peer, effective, retried, t)
+                retried = true
+            }
         }
-        return response.body()
     }
 
     /** Fetch the peer's custom avatar bytes; throws on 4xx/5xx. */
@@ -124,11 +156,20 @@ class MessageClient(
         peer: Peer,
         path: String,
     ): ByteArray {
-        val response: HttpResponse = http.get("http://${peer.host}:${peer.port}$path")
-        if (!response.status.isSuccess()) {
-            error("Peer rejected $path: HTTP ${response.status.value}")
+        var effective = peer
+        var retried = false
+        while (true) {
+            try {
+                val response: HttpResponse = http.get("http://${effective.host}:${effective.port}$path")
+                if (!response.status.isSuccess()) {
+                    error("Peer rejected $path: HTTP ${response.status.value}")
+                }
+                return response.readBytes()
+            } catch (t: Throwable) {
+                effective = rediscoverOrThrow(peer, effective, retried, t)
+                retried = true
+            }
         }
-        return response.readBytes()
     }
 
     private suspend inline fun <reified T> postJson(
@@ -136,13 +177,99 @@ class MessageClient(
         path: String,
         body: T,
     ) {
-        val response: HttpResponse =
-            http.post("http://${peer.host}:${peer.port}$path") {
-                contentType(ContentType.Application.Json)
-                setBody(body)
+        var effective = peer
+        var retried = false
+        while (true) {
+            try {
+                val response: HttpResponse =
+                    http.post("http://${effective.host}:${effective.port}$path") {
+                        contentType(ContentType.Application.Json)
+                        setBody(body)
+                    }
+                if (!response.status.isSuccess()) {
+                    error("Peer rejected $path: HTTP ${response.status.value}")
+                }
+                return
+            } catch (t: Throwable) {
+                effective = rediscoverOrThrow(peer, effective, retried, t)
+                retried = true
             }
-        if (!response.status.isSuccess()) {
-            error("Peer rejected $path: HTTP ${response.status.value}")
         }
+    }
+
+    /**
+     * On a TCP-level connection failure (typical symptom when the peer
+     * restarted on a fresh port and the cached mDNS resolution is stale),
+     * tell discovery to forget+re-resolve the peer's uuid and return the
+     * freshly-resolved [Peer] to retry against. Re-throws if discovery is
+     * unavailable, the failure isn't a connection error, we already
+     * retried, or no fresh resolution arrives in time.
+     */
+    private suspend fun rediscoverOrThrow(
+        original: Peer,
+        attempted: Peer,
+        alreadyRetried: Boolean,
+        cause: Throwable,
+    ): Peer {
+        val discovery = discoveryRepository ?: throw cause
+        if (alreadyRetried) throw cause
+        if (!isConnectFailure(cause)) throw cause
+        discovery.forgetPeer(original.uuid)
+        return withTimeoutOrNull(REDISCOVER_TIMEOUT_MS) {
+            val snapshot =
+                discovery.peerSnapshot.first { map ->
+                    val p = map[original.uuid] ?: return@first false
+                    p.host != attempted.host || p.port != attempted.port
+                }
+            snapshot[original.uuid]
+        } ?: throw cause
+    }
+
+    /**
+     * True when [t] looks like a TCP-level failure to reach the peer (refused,
+     * timeout, no route) rather than a successfully-delivered request that
+     * the peer rejected at the HTTP layer. The latter shouldn't trigger a
+     * rediscover — the peer is alive at the cached address; the failure is
+     * application-level.
+     *
+     * We walk the cause chain because Ktor wraps the underlying socket
+     * exception, and the wrapping varies by engine/platform.
+     */
+    private fun isConnectFailure(t: Throwable): Boolean {
+        var cur: Throwable? = t
+        while (cur != null) {
+            val name = cur::class.simpleName ?: ""
+            if (name == "ConnectException" ||
+                name == "ConnectTimeoutException" ||
+                name == "SocketTimeoutException" ||
+                name == "HttpRequestTimeoutException" ||
+                name == "NoRouteToHostException" ||
+                name == "UnknownHostException" ||
+                name == "PortUnreachableException"
+            ) {
+                return true
+            }
+            val msg = cur.message?.lowercase().orEmpty()
+            if ("connection refused" in msg ||
+                "connect timed out" in msg ||
+                "failed to connect" in msg ||
+                "no route to host" in msg ||
+                "network is unreachable" in msg
+            ) {
+                return true
+            }
+            cur = cur.cause
+        }
+        return false
+    }
+
+    private companion object {
+        /**
+         * Upper bound on how long we wait for NSD/JmDNS to re-resolve the
+         * peer after a connect failure. Long enough for a fresh SRV pull
+         * over a typical LAN; short enough not to make a doomed send hang
+         * the UI noticeably.
+         */
+        const val REDISCOVER_TIMEOUT_MS = 3_000L
     }
 }

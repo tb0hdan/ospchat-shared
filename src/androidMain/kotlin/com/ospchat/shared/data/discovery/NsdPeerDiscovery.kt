@@ -94,6 +94,32 @@ class NsdPeerDiscovery(
         _peers.value = emptyMap()
     }
 
+    /**
+     * Drop our cached resolution for [uuid] and bounce discovery so the
+     * framework re-emits onServiceFound (and we re-resolve, picking up any
+     * port change the peer made on restart). NSD framework caching means
+     * we can't just "re-resolve uuid X" — we have to restart discovery.
+     */
+    @Synchronized
+    override fun forgetPeer(uuid: String) {
+        if (!running) return
+        // Drop both the reverse lookup and the live snapshot entry first so
+        // the UI immediately reflects "offline until re-resolved".
+        val staleNames = nameToUuid.entries.filter { it.value == uuid }.map { it.key }
+        staleNames.forEach { nameToUuid.remove(it) }
+        _peers.update { it - uuid }
+
+        // Bounce discovery so the framework re-emits onServiceFound for all
+        // peers, including the one that just restarted on a new port.
+        val oldListener = discoveryListener ?: return
+        runCatching { nsdManager.stopServiceDiscovery(oldListener) }
+        val newListener = buildDiscoveryListener()
+        discoveryListener = newListener
+        runCatching {
+            nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, newListener)
+        }.onFailure { Log.w(TAG, "discoverServices restart failed", it) }
+    }
+
     private fun buildRegistrationListener() =
         object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {

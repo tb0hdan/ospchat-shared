@@ -3,6 +3,7 @@ package com.ospchat.shared.data.identity
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -67,9 +68,26 @@ class IdentityRepository(
         }
     }
 
+    /**
+     * Last TCP port the embedded server bound to. Persisted so a restart can
+     * re-bind the same port — peers that cache our mDNS resolution (Android
+     * NSD's framework cache, for one) don't fire onServiceFound/Lost for a
+     * port-only change, so reusing the port keeps cross-device messaging
+     * working through a desktop/Android restart.
+     *
+     * Returns `null` on first run / if no port has been persisted yet.
+     */
+    suspend fun lastServerPort(): Int? = store.data.first()[SERVER_PORT_KEY]?.takeIf { it in 1..65535 }
+
+    suspend fun setLastServerPort(port: Int) {
+        require(port in 1..65535) { "port must be a valid TCP port, got $port" }
+        store.edit { it[SERVER_PORT_KEY] = port }
+    }
+
     private companion object {
         val NICKNAME_KEY = stringPreferencesKey("nickname")
         val UUID_KEY = stringPreferencesKey("uuid")
         val AVATAR_HASH_KEY = stringPreferencesKey("avatar_hash")
+        val SERVER_PORT_KEY = intPreferencesKey("server_port")
     }
 }

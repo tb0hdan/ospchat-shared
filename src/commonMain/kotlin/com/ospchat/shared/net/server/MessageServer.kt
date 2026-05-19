@@ -12,6 +12,7 @@ import com.ospchat.shared.data.messages.MessageRepository
 import com.ospchat.shared.data.peers.PeerAvatarSync
 import com.ospchat.shared.data.reactions.ReactionRepository
 import com.ospchat.shared.net.dto.ErrorDto
+import com.ospchat.shared.util.Log
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.install
@@ -60,17 +61,46 @@ class MessageServer(
     @Volatile private var boundPort: Int = 0
     private val lock = Any()
 
+    /**
+     * Starts the embedded server. If [preferredPort] is non-zero and free, the
+     * server binds to it; if the bind fails (typically EADDRINUSE), falls back
+     * to an ephemeral port (kernel-assigned). Returns the actually-bound port.
+     *
+     * Reusing the previous boot's port across restarts is what keeps peers
+     * reachable through a desktop/Android restart — the mDNS resolution
+     * cached by the peer's NSD framework doesn't fire an update for a
+     * port-only change, so changing the port on each boot strands the peer.
+     */
     suspend fun start(
         uuid: String,
         nickname: String,
+        preferredPort: Int = 0,
     ): Int {
         synchronized(lock) {
             if (engine != null) return boundPort
         }
         val identity = ServerIdentity(uuid = uuid, nickname = nickname)
 
+        if (preferredPort in 1..65535) {
+            tryBind(identity, preferredPort)?.let { return it }
+            Log.w(TAG, "Preferred port $preferredPort unavailable; falling back to ephemeral")
+        }
+        return tryBind(identity, 0)
+            ?: error("Could not bind to any TCP port")
+    }
+
+    /**
+     * Build and start the embedded engine on [port] (0 = ephemeral). Returns
+     * the bound port on success, or `null` if the bind failed (e.g. port in
+     * use) so the caller can fall back. Other failures (engine construction
+     * issues, configuration bugs) still throw.
+     */
+    private suspend fun tryBind(
+        identity: ServerIdentity,
+        port: Int,
+    ): Int? {
         val server =
-            embeddedServer(CIO, port = 0, host = "0.0.0.0") {
+            embeddedServer(CIO, port = port, host = "0.0.0.0") {
                 install(ContentNegotiation) { json() }
                 install(StatusPages) {
                     exception<BadRequestException> { call, cause ->
@@ -113,9 +143,9 @@ class MessageServer(
         }
         try {
             server.start(wait = false)
-            val port = server.resolvedConnectors().first().port
-            boundPort = port
-            return port
+            val bound = server.resolvedConnectors().first().port
+            boundPort = bound
+            return bound
         } catch (t: Throwable) {
             synchronized(lock) {
                 if (engine === server) {
@@ -124,8 +154,34 @@ class MessageServer(
                 }
             }
             runCatching { server.stop(gracePeriodMillis = 0, timeoutMillis = STOP_TIMEOUT_MS) }
+            if (port != 0 && isBindFailure(t)) {
+                return null
+            }
             throw t
         }
+    }
+
+    /**
+     * True for the OS-level "address already in use" / permission-denied
+     * variants Ktor surfaces when an explicit port is taken. We test by
+     * walking the cause chain because Ktor CIO wraps the underlying NIO
+     * exception in its own bind-failure type on some platforms.
+     */
+    private fun isBindFailure(t: Throwable): Boolean {
+        var cur: Throwable? = t
+        while (cur != null) {
+            val name = cur::class.simpleName ?: ""
+            if (name == "BindException" || name == "ChannelBindException") return true
+            val msg = cur.message?.lowercase().orEmpty()
+            if ("address already in use" in msg ||
+                ("bind" in msg && "fail" in msg) ||
+                "permission denied" in msg
+            ) {
+                return true
+            }
+            cur = cur.cause
+        }
+        return false
     }
 
     fun stop() {
@@ -140,6 +196,7 @@ class MessageServer(
     }
 
     private companion object {
+        const val TAG = "MessageServer"
         const val STOP_TIMEOUT_MS = 1_000L
     }
 }

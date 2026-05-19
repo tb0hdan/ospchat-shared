@@ -26,4 +26,18 @@ interface PeerDiscoveryService {
     )
 
     fun stop()
+
+    /**
+     * Drop the cached resolution for [uuid] and ask the framework to
+     * re-resolve. Used by the send pipeline when a POST to the cached
+     * address fails — the peer may have restarted on a fresh port, and
+     * the platform NSD layers (Android NSD's framework cache especially)
+     * don't fire onServiceFound for a port-only change.
+     *
+     * Implementations should remove the peer from [peers] eagerly so the
+     * UI reflects the offline-until-rediscovered state, then trigger a
+     * fresh resolve. A no-op is acceptable if the implementation has no
+     * way to force re-resolution.
+     */
+    fun forgetPeer(uuid: String)
 }
