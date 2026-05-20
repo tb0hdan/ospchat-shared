@@ -2,6 +2,7 @@ package com.ospchat.shared.net.server
 
 import com.ospchat.shared.data.attachments.AttachmentStore
 import com.ospchat.shared.data.avatar.AvatarStore
+import com.ospchat.shared.data.calls.CallRepository
 import com.ospchat.shared.data.discovery.DiscoveryRepository
 import com.ospchat.shared.data.discovery.Peer
 import com.ospchat.shared.data.groups.GroupMessageRepository
@@ -12,6 +13,10 @@ import com.ospchat.shared.data.messages.MessageRepository
 import com.ospchat.shared.data.peers.PeerAvatarSync
 import com.ospchat.shared.data.reactions.ReactionRepository
 import com.ospchat.shared.net.ApiVersion
+import com.ospchat.shared.net.dto.CallAnswerDto
+import com.ospchat.shared.net.dto.CallHangupDto
+import com.ospchat.shared.net.dto.CallIceDto
+import com.ospchat.shared.net.dto.CallOfferDto
 import com.ospchat.shared.net.dto.ErrorDto
 import com.ospchat.shared.net.dto.GroupLeaveDto
 import com.ospchat.shared.net.dto.GroupMessagePostDto
@@ -59,6 +64,7 @@ fun Routing.installMessageRoutes(
     groupMessageRepository: GroupMessageRepository? = null,
     groupRepository: GroupRepository? = null,
     groupSyncer: GroupSyncer? = null,
+    callRepository: CallRepository? = null,
     avatarHashSupplier: suspend () -> String? = { null },
 ) {
     route("/v1") {
@@ -145,6 +151,34 @@ fun Routing.installMessageRoutes(
                 return@get
             }
             call.respondBytes(bytes = bytes, contentType = ContentType.Image.JPEG)
+        }
+        if (callRepository != null) {
+            route("/call") {
+                post("/offer") {
+                    val dto = call.receive<CallOfferDto>()
+                    val known = call.verifiedPeerOrRespond(dto.fromUuid, discoveryRepository) ?: return@post
+                    callRepository.applyOffer(known, dto)
+                    call.respond(HttpStatusCode.Accepted)
+                }
+                post("/answer") {
+                    val dto = call.receive<CallAnswerDto>()
+                    val known = call.verifiedPeerOrRespond(dto.fromUuid, discoveryRepository) ?: return@post
+                    callRepository.applyAnswer(known, dto)
+                    call.respond(HttpStatusCode.Accepted)
+                }
+                post("/ice") {
+                    val dto = call.receive<CallIceDto>()
+                    val known = call.verifiedPeerOrRespond(dto.fromUuid, discoveryRepository) ?: return@post
+                    callRepository.applyIce(known, dto)
+                    call.respond(HttpStatusCode.Accepted)
+                }
+                post("/hangup") {
+                    val dto = call.receive<CallHangupDto>()
+                    val known = call.verifiedPeerOrRespond(dto.fromUuid, discoveryRepository) ?: return@post
+                    callRepository.applyHangup(known, dto)
+                    call.respond(HttpStatusCode.Accepted)
+                }
+            }
         }
         if (groupMessageRepository != null && groupRepository != null && groupSyncer != null) {
             route("/groups") {

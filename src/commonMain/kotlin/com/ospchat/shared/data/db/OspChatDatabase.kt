@@ -7,6 +7,8 @@ import androidx.room.RoomDatabaseConstructor
 import androidx.room.migration.Migration
 import androidx.sqlite.SQLiteConnection
 import androidx.sqlite.execSQL
+import com.ospchat.shared.data.calls.CallDao
+import com.ospchat.shared.data.calls.CallEntity
 import com.ospchat.shared.data.groups.GroupDao
 import com.ospchat.shared.data.groups.GroupEntity
 import com.ospchat.shared.data.groups.GroupMemberEntity
@@ -32,8 +34,9 @@ import com.ospchat.shared.data.reactions.ReactionEntity
         GroupEntity::class,
         GroupMemberEntity::class,
         GroupMessageEntity::class,
+        CallEntity::class,
     ],
-    version = 9,
+    version = 10,
     exportSchema = false,
 )
 @ConstructedBy(OspChatDatabaseConstructor::class)
@@ -49,6 +52,8 @@ abstract class OspChatDatabase : RoomDatabase() {
     abstract fun groupDao(): GroupDao
 
     abstract fun groupMessageDao(): GroupMessageDao
+
+    abstract fun callDao(): CallDao
 }
 
 expect object OspChatDatabaseConstructor : RoomDatabaseConstructor<OspChatDatabase>
@@ -271,7 +276,40 @@ internal val MIGRATION_8_9 =
     }
 
 /**
- * The full set of migrations (v1 → v9). Apply these via
+ * v9 → v10: adds the `calls` table backing the audio-call feature. One row per
+ * call (incoming or outgoing); the row is created at offer/accept time and
+ * mutated through `RINGING → CONNECTING → CONNECTED → ENDED`. Indexed by
+ * `(peer_uuid, started_at)` to support a future per-peer history view; phase
+ * 1 only consumes the "active call" query so no UI depends on this index yet.
+ */
+internal val MIGRATION_9_10 =
+    object : Migration(9, 10) {
+        override fun migrate(connection: SQLiteConnection) {
+            connection.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS `calls` (
+                    `id` TEXT NOT NULL,
+                    `peer_uuid` TEXT NOT NULL,
+                    `peer_nickname` TEXT NOT NULL,
+                    `direction` TEXT NOT NULL,
+                    `state` TEXT NOT NULL,
+                    `started_at` INTEGER NOT NULL,
+                    `connected_at` INTEGER,
+                    `ended_at` INTEGER,
+                    `end_reason` TEXT,
+                    PRIMARY KEY(`id`)
+                )
+                """.trimIndent(),
+            )
+            connection.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_calls_peer_uuid_started_at` " +
+                    "ON `calls` (`peer_uuid`, `started_at`)",
+            )
+        }
+    }
+
+/**
+ * The full set of migrations (v1 → v10). Apply these via
  * `Room.databaseBuilder<OspChatDatabase>(...).addMigrations(*OSPCHAT_MIGRATIONS).build()`.
  *
  * Migration bodies are pure `execSQL` against [SQLiteConnection] — the Room
@@ -288,4 +326,5 @@ val OSPCHAT_MIGRATIONS: Array<Migration> =
         MIGRATION_6_7,
         MIGRATION_7_8,
         MIGRATION_8_9,
+        MIGRATION_9_10,
     )

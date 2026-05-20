@@ -2,6 +2,10 @@ package com.ospchat.shared.net.client
 
 import com.ospchat.shared.data.discovery.DiscoveryRepository
 import com.ospchat.shared.data.discovery.Peer
+import com.ospchat.shared.net.dto.CallAnswerDto
+import com.ospchat.shared.net.dto.CallHangupDto
+import com.ospchat.shared.net.dto.CallIceDto
+import com.ospchat.shared.net.dto.CallOfferDto
 import com.ospchat.shared.net.dto.GroupLeaveDto
 import com.ospchat.shared.net.dto.GroupMessagePostDto
 import com.ospchat.shared.net.dto.GroupSnapshotDto
@@ -77,6 +81,45 @@ class MessageClient(
         body: GroupLeaveDto,
     ) {
         postJson(peer, "/v1/groups/leave", body)
+    }
+
+    suspend fun sendCallOffer(
+        peer: Peer,
+        body: CallOfferDto,
+    ) {
+        postJson(peer, "/v1/call/offer", body)
+    }
+
+    suspend fun sendCallAnswer(
+        peer: Peer,
+        body: CallAnswerDto,
+    ) {
+        postJson(peer, "/v1/call/answer", body)
+    }
+
+    /**
+     * Trickle one ICE candidate. Opts out of the rediscover-and-retry path:
+     * a single dropped candidate is not worth re-resolving discovery; the
+     * remaining candidates will continue to flow and ICE will pick whichever
+     * pair connects first.
+     */
+    suspend fun sendCallIce(
+        peer: Peer,
+        body: CallIceDto,
+    ) {
+        postJson(peer, "/v1/call/ice", body, rediscover = false)
+    }
+
+    /**
+     * Best-effort hangup. We don't retry on connect failure — by the time
+     * hangup fires the call is over locally; if the peer is unreachable
+     * they'll figure it out from their own ICE timeout.
+     */
+    suspend fun sendCallHangup(
+        peer: Peer,
+        body: CallHangupDto,
+    ) {
+        postJson(peer, "/v1/call/hangup", body, rediscover = false)
     }
 
     suspend fun syncGroups(

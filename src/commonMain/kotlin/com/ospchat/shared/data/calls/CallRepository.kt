@@ -1,0 +1,467 @@
+package com.ospchat.shared.data.calls
+
+import com.ospchat.shared.data.discovery.DiscoveryRepository
+import com.ospchat.shared.data.discovery.Peer
+import com.ospchat.shared.data.identity.IdentityRepository
+import com.ospchat.shared.data.peers.PeerDao
+import com.ospchat.shared.media.AudioCallSession
+import com.ospchat.shared.media.AudioCallSessionFactory
+import com.ospchat.shared.media.toCandidate
+import com.ospchat.shared.media.toDto
+import com.ospchat.shared.net.client.MessageClient
+import com.ospchat.shared.net.dto.CallAnswerDto
+import com.ospchat.shared.net.dto.CallHangupDto
+import com.ospchat.shared.net.dto.CallIceDto
+import com.ospchat.shared.net.dto.CallOfferDto
+import com.ospchat.shared.notifications.CallNotifier
+import com.ospchat.shared.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.datetime.Clock
+import kotlin.uuid.ExperimentalUuidApi
+import kotlin.uuid.Uuid
+
+/**
+ * Orchestrates one audio call at a time across:
+ *  - the wire (4 signaling endpoints via [MessageClient]),
+ *  - the local DB (`calls` table — full history for phase 2's UI),
+ *  - the platform's WebRTC session ([AudioCallSession] via
+ *    [AudioCallSessionFactory]),
+ *  - and the user-visible ringer ([CallNotifier]).
+ *
+ * Phase 1 invariant: **at most one active call exists at any time**. An
+ * incoming offer that arrives while a call is active is auto-hung-up with
+ * reason `BUSY`; the row is not even stored.
+ *
+ * Wire / state machine:
+ *
+ * ```
+ * Caller side                        Callee side
+ * -----------                        -----------
+ * startCall() →
+ *   create session, createOffer()
+ *   INSERT Call(RINGING, OUTGOING)
+ *   POST /v1/call/offer ─────────→  applyOffer()
+ *                                     INSERT Call(RINGING, INCOMING)
+ *                                     notifier.notifyIncomingCall()
+ *                                   acceptCall()  (or hangUp())
+ *                                     create session, acceptOffer()
+ *                                     UPDATE state=CONNECTING
+ *                                     POST /v1/call/answer
+ *   applyAnswer() ←──────────────────/
+ *     session.setRemoteAnswer()
+ *     UPDATE state=CONNECTING
+ *   (both sides exchange ICE via /v1/call/ice)
+ *   session → CONNECTED              session → CONNECTED
+ *   UPDATE state=CONNECTED           UPDATE state=CONNECTED
+ *
+ * Either side, any phase:
+ * hangUp() / applyHangup() → close session, UPDATE state=ENDED
+ * ```
+ *
+ * The [AudioCallSession] interface is intentionally narrow: this repository
+ * owns the wiring (ICE forwarding, state mirroring) so platform actuals
+ * only have to wrap libwebrtc.
+ */
+@OptIn(ExperimentalUuidApi::class)
+class CallRepository(
+    private val dao: CallDao,
+    private val client: MessageClient,
+    private val identityRepository: IdentityRepository,
+    private val discoveryRepository: DiscoveryRepository,
+    private val sessionFactory: AudioCallSessionFactory,
+    private val notifier: CallNotifier,
+    private val peerDao: PeerDao? = null,
+    private val ringTimeoutMs: Long = DEFAULT_RING_TIMEOUT_MS,
+) {
+    /** Live row for the call that isn't yet `ENDED`, or `null` when idle. */
+    val activeCall: Flow<Call?> = dao.observeActive().map { it?.toDomain() }
+
+    /** Full history; phase 2 surfaces this in a dedicated screen. */
+    val history: Flow<List<Call>> = dao.observeHistory().map { rows -> rows.map(CallEntity::toDomain) }
+
+    private val mutex = Mutex()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    // The currently-active call's session + the jobs forwarding its flows to
+    // the wire / DB. Cleared on hangup.
+    private var current: ActiveCall? = null
+
+    // Inbound offers that have arrived but the user hasn't accepted yet. Held
+    // in memory only — the SDP isn't useful across an app restart (peer will
+    // have moved on by then).
+    private val pendingOffers = mutableMapOf<String, PendingOffer>()
+
+    // ---- Outbound (user-initiated) -----------------------------------------
+
+    /**
+     * Start an outbound call to [peer]. Creates the session, generates the
+     * SDP offer, POSTs `/v1/call/offer`, and starts the ICE / state
+     * forwarders. Returns the freshly-minted call id (UUID).
+     *
+     * Throws if a call is already active.
+     */
+    suspend fun startCall(peer: Peer): String {
+        val selfUuid = identityRepository.ensureUuid()
+        val selfNickname = identityRepository.nicknameFlow.first().orEmpty()
+        val callId = Uuid.random().toString()
+        val startedAt = Clock.System.now().toEpochMilliseconds()
+
+        mutex.withLock {
+            check(current == null) { "another call is already active" }
+            val session = sessionFactory.create()
+            val sdp = session.createOffer()
+            val call =
+                Call(
+                    id = callId,
+                    peerUuid = peer.uuid,
+                    peerNickname = peer.nickname,
+                    direction = Call.Direction.OUTGOING,
+                    state = Call.State.RINGING,
+                    startedAt = startedAt,
+                )
+            dao.upsert(call.toEntity())
+            current = bindSession(callId = callId, peer = peer, session = session, selfUuid = selfUuid)
+            // Schedule the no-answer timeout. The launcher is cancelled when
+            // the call leaves RINGING (acceptance or hangup).
+            current?.ringTimeoutJob =
+                scope.launch {
+                    delay(ringTimeoutMs)
+                    val row = dao.findById(callId) ?: return@launch
+                    if (row.state == Call.State.RINGING.name) {
+                        hangUp(callId, Call.EndReason.NO_ANSWER)
+                    }
+                }
+            runCatching {
+                client.sendCallOffer(
+                    peer,
+                    CallOfferDto(
+                        callId = callId,
+                        fromUuid = selfUuid,
+                        fromNickname = selfNickname,
+                        sdp = sdp,
+                        sentAt = startedAt,
+                    ),
+                )
+            }.onFailure {
+                Log.w(TAG, "sendCallOffer failed", it)
+                tearDown(callId, Call.EndReason.FAILED)
+            }
+        }
+        return callId
+    }
+
+    /**
+     * Accept a pending incoming call. Creates the session, sets the remote
+     * offer (stashed in [pendingOffers] by [applyOffer]), POSTs
+     * `/v1/call/answer`, and starts the ICE / state forwarders.
+     */
+    suspend fun acceptCall(callId: String) {
+        val selfUuid = identityRepository.ensureUuid()
+        val pending: PendingOffer
+        mutex.withLock {
+            pending = pendingOffers.remove(callId) ?: return
+            check(current == null) { "another call is already active" }
+            val session = sessionFactory.create()
+            val answerSdp = session.acceptOffer(pending.remoteSdp)
+            val row = dao.findById(callId) ?: return
+            val updated =
+                row.toDomain().copy(state = Call.State.CONNECTING).toEntity()
+            dao.upsert(updated)
+            current = bindSession(callId = callId, peer = pending.peer, session = session, selfUuid = selfUuid)
+            notifier.cancel(callId)
+            runCatching {
+                client.sendCallAnswer(
+                    pending.peer,
+                    CallAnswerDto(callId = callId, fromUuid = selfUuid, sdp = answerSdp),
+                )
+            }.onFailure {
+                Log.w(TAG, "sendCallAnswer failed", it)
+                tearDown(callId, Call.EndReason.FAILED)
+            }
+        }
+    }
+
+    /**
+     * End [callId] from this side. Closes the session, POSTs
+     * `/v1/call/hangup` (best-effort — local cleanup proceeds either way),
+     * marks the row `ENDED` with [reason]. Safe to call at any phase.
+     */
+    suspend fun hangUp(
+        callId: String,
+        reason: Call.EndReason = Call.EndReason.HANGUP,
+    ) {
+        val selfUuid = identityRepository.ensureUuid()
+        val peer: Peer?
+        mutex.withLock {
+            val pending = pendingOffers.remove(callId)
+            peer = pending?.peer ?: current?.peer ?: resolvePeer(callId)
+            tearDown(callId, reason)
+            notifier.cancel(callId)
+        }
+        if (peer != null) {
+            runCatching {
+                client.sendCallHangup(
+                    peer,
+                    CallHangupDto(callId = callId, fromUuid = selfUuid, reason = reason.name),
+                )
+            }.onFailure { Log.w(TAG, "sendCallHangup failed", it) }
+        }
+    }
+
+    /** Mute or unmute the local microphone for the active call. */
+    suspend fun setMuted(
+        callId: String,
+        muted: Boolean,
+    ) {
+        mutex.withLock {
+            val active = current ?: return
+            if (active.callId != callId) return
+            active.session.setMuted(muted)
+        }
+    }
+
+    // ---- Inbound (server-route-driven) -------------------------------------
+
+    /**
+     * Handle a `POST /v1/call/offer`. If we're already on a call, auto-reject
+     * with reason `BUSY` and do not store the row. Otherwise persist the
+     * call as `RINGING` / `INCOMING`, stash the offer SDP, and ring the
+     * user via [notifier].
+     */
+    suspend fun applyOffer(
+        sender: Peer,
+        dto: CallOfferDto,
+    ) {
+        val selfUuid = identityRepository.ensureUuid()
+        mutex.withLock {
+            if (current != null || pendingOffers.isNotEmpty()) {
+                // Best-effort busy-hangup back to the caller.
+                runCatching {
+                    client.sendCallHangup(
+                        sender,
+                        CallHangupDto(
+                            callId = dto.callId,
+                            fromUuid = selfUuid,
+                            reason = Call.EndReason.BUSY.name,
+                        ),
+                    )
+                }.onFailure { Log.w(TAG, "busy-hangup back failed", it) }
+                return
+            }
+            val call =
+                Call(
+                    id = dto.callId,
+                    peerUuid = sender.uuid,
+                    peerNickname = dto.fromNickname,
+                    direction = Call.Direction.INCOMING,
+                    state = Call.State.RINGING,
+                    startedAt = dto.sentAt,
+                )
+            dao.upsert(call.toEntity())
+            pendingOffers[dto.callId] = PendingOffer(peer = sender, remoteSdp = dto.sdp)
+            notifier.notifyIncomingCall(call)
+        }
+    }
+
+    /**
+     * Handle a `POST /v1/call/answer`. Install the answer SDP on our open
+     * session; transition the row to `CONNECTING`. ICE will complete
+     * asynchronously and move the state to `CONNECTED`.
+     */
+    suspend fun applyAnswer(
+        sender: Peer,
+        dto: CallAnswerDto,
+    ) {
+        mutex.withLock {
+            val active = current ?: return
+            if (active.callId != dto.callId) return
+            if (active.peer.uuid != sender.uuid) return
+            active.session.setRemoteAnswer(dto.sdp)
+            val row = dao.findById(dto.callId) ?: return
+            if (row.state == Call.State.RINGING.name) {
+                dao.upsert(row.toDomain().copy(state = Call.State.CONNECTING).toEntity())
+                active.ringTimeoutJob?.cancel()
+            }
+        }
+    }
+
+    /** Handle a `POST /v1/call/ice`. Adds the candidate to our open session. */
+    suspend fun applyIce(
+        sender: Peer,
+        dto: CallIceDto,
+    ) {
+        mutex.withLock {
+            val active = current ?: return
+            if (active.callId != dto.callId) return
+            if (active.peer.uuid != sender.uuid) return
+            runCatching { active.session.addRemoteIce(dto.toCandidate()) }
+                .onFailure { Log.w(TAG, "addRemoteIce failed", it) }
+        }
+    }
+
+    /**
+     * Handle a `POST /v1/call/hangup`. Closes the session if any, marks the
+     * row `ENDED` with the wire-supplied reason (or `HANGUP` if absent),
+     * stops ringing if it was a pending incoming.
+     */
+    suspend fun applyHangup(
+        sender: Peer,
+        dto: CallHangupDto,
+    ) {
+        mutex.withLock {
+            val reason =
+                dto.reason?.let { runCatching { Call.EndReason.valueOf(it) }.getOrNull() }
+                    ?: Call.EndReason.HANGUP
+            val pending = pendingOffers.remove(dto.callId)
+            if (pending != null && pending.peer.uuid != sender.uuid) {
+                // Ignore stray hangups from unrelated peers on a pending offer.
+                pendingOffers[dto.callId] = pending
+                return
+            }
+            val active = current
+            if (active != null && active.callId == dto.callId && active.peer.uuid != sender.uuid) {
+                return
+            }
+            tearDown(dto.callId, reason)
+            notifier.cancel(dto.callId)
+        }
+    }
+
+    // ---- Internals ---------------------------------------------------------
+
+    private fun bindSession(
+        callId: String,
+        peer: Peer,
+        session: AudioCallSession,
+        selfUuid: String,
+    ): ActiveCall {
+        val iceJob =
+            scope.launch {
+                session.localIceCandidates.collect { candidate ->
+                    runCatching { client.sendCallIce(peer, candidate.toDto(callId, selfUuid)) }
+                        .onFailure { Log.w(TAG, "sendCallIce failed", it) }
+                }
+            }
+        val stateJob =
+            scope.launch {
+                session.state.collect { sessionState ->
+                    onSessionStateChange(callId, sessionState)
+                }
+            }
+        return ActiveCall(
+            callId = callId,
+            peer = peer,
+            session = session,
+            iceForwarderJob = iceJob,
+            stateObserverJob = stateJob,
+        )
+    }
+
+    private suspend fun onSessionStateChange(
+        callId: String,
+        sessionState: AudioCallSession.State,
+    ) {
+        when (sessionState) {
+            AudioCallSession.State.CONNECTED -> {
+                mutex.withLock {
+                    val row = dao.findById(callId) ?: return@withLock
+                    if (row.state != Call.State.CONNECTED.name) {
+                        val now = Clock.System.now().toEpochMilliseconds()
+                        dao.upsert(
+                            row
+                                .toDomain()
+                                .copy(state = Call.State.CONNECTED, connectedAt = now)
+                                .toEntity(),
+                        )
+                        current?.ringTimeoutJob?.cancel()
+                    }
+                }
+            }
+
+            AudioCallSession.State.FAILED -> {
+                mutex.withLock { tearDown(callId, Call.EndReason.FAILED) }
+                notifier.cancel(callId)
+            }
+
+            else -> {
+                Unit
+            }
+        }
+    }
+
+    /**
+     * Mark [callId] `ENDED`, close + clear the session, cancel forwarders.
+     * Must be invoked under [mutex].
+     */
+    private suspend fun tearDown(
+        callId: String,
+        reason: Call.EndReason,
+    ) {
+        val row = dao.findById(callId)
+        if (row != null && row.state != Call.State.ENDED.name) {
+            val now = Clock.System.now().toEpochMilliseconds()
+            dao.upsert(
+                row
+                    .toDomain()
+                    .copy(state = Call.State.ENDED, endedAt = now, endReason = reason)
+                    .toEntity(),
+            )
+        }
+        val active = current
+        if (active != null && active.callId == callId) {
+            active.iceForwarderJob.cancel()
+            active.stateObserverJob.cancel()
+            active.ringTimeoutJob?.cancel()
+            runCatching { active.session.close() }.onFailure { Log.w(TAG, "session.close failed", it) }
+            current = null
+        }
+        pendingOffers.remove(callId)
+    }
+
+    private suspend fun resolvePeer(callId: String): Peer? {
+        val row = dao.findById(callId) ?: return null
+        discoveryRepository.findPeer(row.peerUuid)?.let { return it }
+        val entity = peerDao?.findByUuid(row.peerUuid) ?: return null
+        return Peer(
+            uuid = entity.uuid,
+            nickname = entity.nickname,
+            host = entity.lastHost,
+            port = entity.lastPort,
+        )
+    }
+
+    private data class PendingOffer(
+        val peer: Peer,
+        val remoteSdp: String,
+    )
+
+    private data class ActiveCall(
+        val callId: String,
+        val peer: Peer,
+        val session: AudioCallSession,
+        val iceForwarderJob: Job,
+        val stateObserverJob: Job,
+        var ringTimeoutJob: Job? = null,
+    )
+
+    private companion object {
+        const val TAG = "CallRepo"
+
+        /**
+         * How long an outbound call rings before auto-hangup with reason
+         * [Call.EndReason.NO_ANSWER]. Matches the typical mobile ring length
+         * (~30s) so the user doesn't sit watching "Calling…" forever.
+         */
+        const val DEFAULT_RING_TIMEOUT_MS = 30_000L
+    }
+}

@@ -2,6 +2,7 @@ package com.ospchat.shared.net.server
 
 import com.ospchat.shared.data.attachments.AttachmentStore
 import com.ospchat.shared.data.avatar.AvatarStore
+import com.ospchat.shared.data.calls.CallRepository
 import com.ospchat.shared.data.discovery.DiscoveryRepository
 import com.ospchat.shared.data.groups.GroupMessageRepository
 import com.ospchat.shared.data.groups.GroupRepository
@@ -55,6 +56,7 @@ class MessageServer(
     private val groupMessageRepository: GroupMessageRepository? = null,
     private val groupRepository: GroupRepository? = null,
     private val groupSyncer: GroupSyncer? = null,
+    private val callRepository: CallRepository? = null,
 ) {
     @Volatile private var engine: ApplicationEngine? = null
 
@@ -129,6 +131,7 @@ class MessageServer(
                         groupMessageRepository = groupMessageRepository,
                         groupRepository = groupRepository,
                         groupSyncer = groupSyncer,
+                        callRepository = callRepository,
                         avatarHashSupplier = { identityRepository.currentAvatarHash() },
                     )
                 }

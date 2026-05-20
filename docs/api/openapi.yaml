@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: OSPChat Peer API
-  version: 0.9.0
+  version: 0.10.0
   description: |
     REST API exposed by every OSPChat peer on the local network. Each running
     instance binds an embedded Ktor server to an ephemeral TCP port; that port
@@ -42,6 +42,12 @@ tags:
     description: Endpoints for exchanging chat messages.
   - name: groups
     description: Endpoints for group chats and broadcast channels.
+  - name: calls
+    description: |
+      Signaling endpoints for one-to-one audio calls. Media itself rides
+      libwebrtc over UDP once ICE has connected; only SDP and ICE flow
+      through these HTTP routes. Phase 1 is audio-only; video is out of
+      scope until a later API version.
 paths:
   /v1/info:
     get:
@@ -360,6 +366,115 @@ paths:
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
+  /v1/call/offer:
+    post:
+      tags: [calls]
+      summary: Invite the peer to a new audio call.
+      description: |
+        Sent by the caller to initiate a call. The body carries the
+        sender-generated `callId` (UUID — both sides reference it for every
+        subsequent message) and the SDP offer.
+
+        Receivers auto-reject with `POST /v1/call/hangup` (`reason: BUSY`)
+        when another call is already active — the row is not persisted in
+        that case. Otherwise they store the call as `RINGING` / `INCOMING`,
+        stash the offer SDP in memory until the user accepts or declines,
+        and ring the user via the platform's notification surface.
+
+        Authenticated by `fromUuid` against the live NSD snapshot, identical
+        to `POST /v1/messages`.
+      operationId: postCallOffer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CallOffer"
+      responses:
+        "202":
+          description: Offer accepted; the receiver will either accept or hang up.
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/call/answer:
+    post:
+      tags: [calls]
+      summary: Accept an incoming call.
+      description: |
+        Sent by the callee after the user clicks "Accept". Carries the SDP
+        answer to install on the caller's open `RTCPeerConnection`. After
+        this message ICE candidates may flow in both directions via
+        `/v1/call/ice`; once ICE connects, media is flowing and the call
+        transitions to `CONNECTED` on both sides.
+      operationId: postCallAnswer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CallAnswer"
+      responses:
+        "202":
+          description: Answer accepted.
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/call/ice:
+    post:
+      tags: [calls]
+      summary: Trickle one ICE candidate.
+      description: |
+        Sent zero or more times by either side during ICE gathering. Phase 1
+        restricts gathering to host candidates only (LAN-only OSPChat
+        deployments — no STUN, no TURN). Receivers add each candidate to
+        the live `RTCPeerConnection`; missing candidates are tolerated
+        because ICE will pick whichever pair connects first.
+      operationId: postCallIce
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CallIce"
+      responses:
+        "202":
+          description: ICE candidate accepted.
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/call/hangup:
+    post:
+      tags: [calls]
+      summary: End an active or pending call.
+      description: |
+        Sent by either side, at any phase. Covers all four termination
+        cases — rejecting an incoming offer (while still `RINGING`),
+        cancelling an outgoing offer (before answer), ending a connected
+        call, and auto-rejecting because the local side was already on
+        another call (`reason: BUSY`).
+
+        The receiver closes its `RTCPeerConnection` if open and marks the
+        row `ENDED` with the wire-supplied `reason` (or `HANGUP` if
+        absent). Always best-effort: the sender does not retry on failure;
+        if the peer is unreachable they'll figure it out from their own
+        ICE timeout.
+      operationId: postCallHangup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CallHangup"
+      responses:
+        "202":
+          description: Hangup accepted.
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /v1/groups/leave:
     post:
       tags: [groups]
@@ -649,6 +764,85 @@ components:
         fromUuid:
           type: string
           format: uuid
+    CallOffer:
+      type: object
+      required: [callId, fromUuid, fromNickname, sdp, sentAt]
+      properties:
+        callId:
+          type: string
+          format: uuid
+          description: |
+            Sender-generated identifier for this call. Both sides reference
+            it for every subsequent signaling message (`answer`, `ice`,
+            `hangup`).
+        fromUuid:
+          type: string
+          format: uuid
+        fromNickname:
+          type: string
+        sdp:
+          type: string
+          description: SDP offer text as produced by `RTCPeerConnection.createOffer`.
+        sentAt:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the caller initiated the call.
+    CallAnswer:
+      type: object
+      required: [callId, fromUuid, sdp]
+      properties:
+        callId:
+          type: string
+          format: uuid
+        fromUuid:
+          type: string
+          format: uuid
+        sdp:
+          type: string
+          description: SDP answer text as produced by `RTCPeerConnection.createAnswer`.
+    CallIce:
+      type: object
+      required: [callId, fromUuid, candidate]
+      properties:
+        callId:
+          type: string
+          format: uuid
+        fromUuid:
+          type: string
+          format: uuid
+        candidate:
+          type: string
+          description: Raw ICE candidate line (e.g. `candidate:0 1 UDP 2122252543 192.168.1.5 9000 typ host`).
+        sdpMid:
+          type: string
+          nullable: true
+          description: Media stream identification tag this candidate belongs to (e.g. `audio`).
+        sdpMLineIndex:
+          type: integer
+          default: 0
+          description: Zero-based index of the m-section this candidate belongs to.
+    CallHangup:
+      type: object
+      required: [callId, fromUuid]
+      properties:
+        callId:
+          type: string
+          format: uuid
+        fromUuid:
+          type: string
+          format: uuid
+        reason:
+          type: string
+          nullable: true
+          enum: [HANGUP, BUSY, NO_ANSWER, FAILED]
+          description: |
+            Why the call ended. Informational only — the receiver maps it
+            into the local `calls` table for the history UI. `HANGUP` (the
+            default if omitted) covers normal user-initiated termination
+            at any phase. `BUSY` is the auto-hangup the receiver issues
+            when an incoming offer arrives during another active call.
+            `NO_ANSWER` is the caller-side ring timeout. `FAILED` is set
+            on local connection-layer errors.
     Error:
       type: object
       required: [error]
