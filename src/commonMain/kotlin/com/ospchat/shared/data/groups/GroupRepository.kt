@@ -248,6 +248,12 @@ class GroupRepository(
 
     suspend fun selfUuid(): String = identityRepository.ensureUuid()
 
+    /** True when [uuid] is in the current member list of [groupId]. */
+    suspend fun isMember(
+        groupId: String,
+        uuid: String,
+    ): Boolean = groupDao.membersOf(groupId).any { it.memberUuid == uuid }
+
     private fun GroupEntity.toRecord(
         memberCount: Int,
         unreadCount: Int,

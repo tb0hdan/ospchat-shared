@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: OSPChat Peer API
-  version: 0.8.0
+  version: 0.9.0
   description: |
     REST API exposed by every OSPChat peer on the local network. Each running
     instance binds an embedded Ktor server to an ephemeral TCP port; that port
@@ -81,6 +81,11 @@ paths:
         Authenticated by `fromUuid` against the live NSD snapshot, with
         the request's source IP matching that peer's advertised host
         (identical to `POST /v1/messages`).
+
+        When `groupId` is set the receiver additionally validates that
+        `fromUuid` is in the current member list of `groupId`; a sender
+        who is not a member is rejected with 404. `groupId` is omitted
+        for DM reactions.
       operationId: postReaction
       requestBody:
         required: true
@@ -490,6 +495,14 @@ components:
           format: int64
           minimum: 0
           description: Unix epoch milliseconds when the reaction was placed.
+        groupId:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            Non-null when the reaction is on a group message — the receiver
+            then validates `fromUuid` against group membership. Omit for DM
+            reactions.
     ReadReceipt:
       type: object
       required: [fromUuid, upToSentAt]
@@ -609,6 +622,15 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/GroupMessage"
+        reactions:
+          type: array
+          description: |
+            Catch-up reactions for messages in [messages]. Each entry has
+            `groupId` set to the enclosing group's id. Receivers upsert
+            keyed on `(messageId, fromUuid)`; `emoji == null` removes.
+            Omitted by peers that predate group reactions.
+          items:
+            $ref: "#/components/schemas/Reaction"
     GroupSyncResponse:
       type: object
       required: [payloads]

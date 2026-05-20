@@ -2,12 +2,14 @@ package com.ospchat.shared.data.groups
 
 import com.ospchat.shared.data.discovery.Peer
 import com.ospchat.shared.data.identity.IdentityRepository
+import com.ospchat.shared.data.reactions.ReactionRepository
 import com.ospchat.shared.net.client.MessageClient
 import com.ospchat.shared.net.dto.GroupMessageDto
 import com.ospchat.shared.net.dto.GroupSyncCursorDto
 import com.ospchat.shared.net.dto.GroupSyncPayloadDto
 import com.ospchat.shared.net.dto.GroupSyncRequestDto
 import com.ospchat.shared.net.dto.GroupSyncResponseDto
+import com.ospchat.shared.net.dto.ReactionDto
 import com.ospchat.shared.util.Log
 
 /**
@@ -27,6 +29,7 @@ class GroupSyncer(
     private val groupRepository: GroupRepository,
     private val client: MessageClient,
     private val identityRepository: IdentityRepository,
+    private val reactionRepository: ReactionRepository? = null,
 ) {
     suspend fun sync(peer: Peer) {
         val sharedGroupIds = groupDao.groupsContaining(peer.uuid)
@@ -76,6 +79,13 @@ class GroupSyncer(
                 ).toEntity(),
             )
         }
+        val rxRepo = reactionRepository
+        if (rxRepo != null) {
+            payload.reactions.forEach { rx ->
+                if (rx.fromUuid !in members) return@forEach
+                rxRepo.applyReaction(rx)
+            }
+        }
     }
 
     /** Server-side responder: build the response for an inbound sync request. */
@@ -100,7 +110,24 @@ class GroupSyncer(
                                 sentAt = it.sentAt,
                             )
                         }
-                GroupSyncPayloadDto(snapshot = snapshot, messages = missing)
+                // Include current reactions for the whole group, not only the
+                // missing slice — a reaction can land on an old message after
+                // the message itself synced, and there's no per-reaction cursor
+                // yet. Idempotent upsert on the receiver makes this safe.
+                val reactions =
+                    reactionRepository
+                        ?.reactionsSnapshotForGroup(group.id)
+                        ?.map { r ->
+                            ReactionDto(
+                                messageId = r.messageId,
+                                fromUuid = r.fromUuid,
+                                fromNickname = r.fromNickname,
+                                emoji = r.emoji,
+                                reactedAt = r.reactedAt,
+                                groupId = group.id,
+                            )
+                        }.orEmpty()
+                GroupSyncPayloadDto(snapshot = snapshot, messages = missing, reactions = reactions)
             }
         return GroupSyncResponseDto(payloads = payloads)
     }

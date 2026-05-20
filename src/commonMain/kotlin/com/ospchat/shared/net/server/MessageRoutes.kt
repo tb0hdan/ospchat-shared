@@ -87,6 +87,17 @@ fun Routing.installMessageRoutes(
         post("/reactions") {
             val dto = call.receive<ReactionDto>()
             call.verifiedPeerOrRespond(dto.fromUuid, discoveryRepository) ?: return@post
+            // For group reactions, the sender must be in the named group's
+            // current member list. DM reactions skip this — the existing
+            // peer/IP check is sufficient.
+            val groupId = dto.groupId
+            if (groupId != null) {
+                val repo = groupRepository
+                if (repo == null || !repo.isMember(groupId, dto.fromUuid)) {
+                    call.respond(HttpStatusCode.NotFound, ErrorDto(ErrorCodes.UNKNOWN_PEER, "not a group member"))
+                    return@post
+                }
+            }
             reactionRepository.applyReaction(dto)
             call.respond(HttpStatusCode.Accepted)
         }

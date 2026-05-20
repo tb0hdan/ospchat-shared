@@ -57,11 +57,19 @@ data class GroupSyncRequestDto(
     val cursors: List<GroupSyncCursorDto>,
 )
 
-/** Per-group sync payload: snapshot the caller should adopt + missing messages. */
+/**
+ * Per-group sync payload: snapshot the caller should adopt + missing messages.
+ *
+ * [reactions] carries every current reaction for messages in this group's
+ * `group_messages` table so the caller catches up on reactions that arrived
+ * while they were offline. Defaults to empty for back-compat with peers that
+ * predate group reactions.
+ */
 @Serializable
 data class GroupSyncPayloadDto(
     val snapshot: GroupSnapshotDto,
     val messages: List<GroupMessageDto>,
+    val reactions: List<ReactionDto> = emptyList(),
 )
 
 /** `POST /v1/groups/sync` response. */
