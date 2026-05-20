@@ -171,6 +171,14 @@ class CallRepository(
                 check(current == null) { "another call is already active" }
                 val session = sessionFactory.create()
                 val answerSdp = session.acceptOffer(pending.remoteSdp)
+                // Drain ICE candidates that arrived while we were ringing.
+                // `acceptOffer` has set the remote description, so libwebrtc
+                // is ready to accept them. See [applyIce] for why these were
+                // buffered instead of dropped.
+                for (candidate in pending.pendingIce) {
+                    runCatching { session.addRemoteIce(candidate) }
+                        .onFailure { Log.w(TAG, "addRemoteIce (buffered) failed", it) }
+                }
                 val row = dao.findById(callId) ?: return@withLock null
                 val updated = row.toDomain().copy(state = Call.State.CONNECTING).toEntity()
                 dao.upsert(updated)
@@ -305,17 +313,32 @@ class CallRepository(
         }
     }
 
-    /** Handle a `POST /v1/call/ice`. Adds the candidate to our open session. */
+    /**
+     * Handle a `POST /v1/call/ice`. Adds the candidate to our open session,
+     * or — if no session is open yet because the callee user hasn't tapped
+     * Accept — buffers it on the matching [PendingOffer] so it can be
+     * applied right after [acceptCall] creates the session. Without this
+     * buffer the caller's trickled host candidates (gathered on the caller
+     * the moment `setLocalDescription` returned, well before the callee
+     * accepts) are dropped, leaving the callee with the answer SDP but no
+     * remote candidates — ICE then stays in CHECKING forever.
+     */
     suspend fun applyIce(
         sender: Peer,
         dto: CallIceDto,
     ) {
         mutex.withLock {
-            val active = current ?: return
-            if (active.callId != dto.callId) return
-            if (active.peer.uuid != sender.uuid) return
-            runCatching { active.session.addRemoteIce(dto.toCandidate()) }
-                .onFailure { Log.w(TAG, "addRemoteIce failed", it) }
+            val active = current
+            if (active != null) {
+                if (active.callId != dto.callId) return
+                if (active.peer.uuid != sender.uuid) return
+                runCatching { active.session.addRemoteIce(dto.toCandidate()) }
+                    .onFailure { Log.w(TAG, "addRemoteIce failed", it) }
+                return
+            }
+            val pending = pendingOffers[dto.callId] ?: return
+            if (pending.peer.uuid != sender.uuid) return
+            pending.pendingIce += dto.toCandidate()
         }
     }
 
@@ -468,6 +491,10 @@ class CallRepository(
         val peer: Peer,
         val remoteSdp: String,
         var timeoutJob: Job? = null,
+        // ICE candidates that arrived before the user accepted. Drained into
+        // the session in [acceptCall] right after `acceptOffer` sets the
+        // remote description.
+        val pendingIce: MutableList<AudioCallSession.IceCandidate> = mutableListOf(),
     )
 
     private data class ActiveCall(
