@@ -86,9 +86,6 @@ class CallRepository(
     /** Live row for the call that isn't yet `ENDED`, or `null` when idle. */
     val activeCall: Flow<Call?> = dao.observeActive().map { it?.toDomain() }
 
-    /** Full history; phase 2 surfaces this in a dedicated screen. */
-    val history: Flow<List<Call>> = dao.observeHistory().map { rows -> rows.map(CallEntity::toDomain) }
-
     private val mutex = Mutex()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -116,47 +113,42 @@ class CallRepository(
         val callId = Uuid.random().toString()
         val startedAt = Clock.System.now().toEpochMilliseconds()
 
-        mutex.withLock {
-            check(current == null) { "another call is already active" }
-            val session = sessionFactory.create()
-            val sdp = session.createOffer()
-            val call =
-                Call(
-                    id = callId,
-                    peerUuid = peer.uuid,
-                    peerNickname = peer.nickname,
-                    direction = Call.Direction.OUTGOING,
-                    state = Call.State.RINGING,
-                    startedAt = startedAt,
+        // Hold the mutex only for in-memory + DB state mutation; HTTP sends
+        // are dispatched outside the lock so they can't block the call
+        // state machine (ICE, hangup, mute) for the duration of the round
+        // trip. On send failure we re-acquire to tear down.
+        val offerDto: CallOfferDto =
+            mutex.withLock {
+                check(current == null) { "another call is already active" }
+                val session = sessionFactory.create()
+                val sdp = session.createOffer()
+                val call =
+                    Call(
+                        id = callId,
+                        peerUuid = peer.uuid,
+                        peerNickname = peer.nickname,
+                        direction = Call.Direction.OUTGOING,
+                        state = Call.State.RINGING,
+                        startedAt = startedAt,
+                    )
+                dao.upsert(call.toEntity())
+                current = bindSession(callId = callId, peer = peer, session = session, selfUuid = selfUuid)
+                // Schedule the no-answer timeout. The launcher is cancelled when
+                // the call leaves RINGING (acceptance or hangup).
+                current?.ringTimeoutJob = scheduleRingTimeout(callId)
+                CallOfferDto(
+                    callId = callId,
+                    fromUuid = selfUuid,
+                    fromNickname = selfNickname,
+                    sdp = sdp,
+                    sentAt = startedAt,
                 )
-            dao.upsert(call.toEntity())
-            current = bindSession(callId = callId, peer = peer, session = session, selfUuid = selfUuid)
-            // Schedule the no-answer timeout. The launcher is cancelled when
-            // the call leaves RINGING (acceptance or hangup).
-            current?.ringTimeoutJob =
-                scope.launch {
-                    delay(ringTimeoutMs)
-                    val row = dao.findById(callId) ?: return@launch
-                    if (row.state == Call.State.RINGING.name) {
-                        hangUp(callId, Call.EndReason.NO_ANSWER)
-                    }
-                }
-            runCatching {
-                client.sendCallOffer(
-                    peer,
-                    CallOfferDto(
-                        callId = callId,
-                        fromUuid = selfUuid,
-                        fromNickname = selfNickname,
-                        sdp = sdp,
-                        sentAt = startedAt,
-                    ),
-                )
-            }.onFailure {
-                Log.w(TAG, "sendCallOffer failed", it)
-                tearDown(callId, Call.EndReason.FAILED)
             }
-        }
+        runCatching { client.sendCallOffer(peer, offerDto) }
+            .onFailure {
+                Log.w(TAG, "sendCallOffer failed", it)
+                mutex.withLock { tearDown(callId, Call.EndReason.FAILED) }
+            }
         return callId
     }
 
@@ -167,26 +159,34 @@ class CallRepository(
      */
     suspend fun acceptCall(callId: String) {
         val selfUuid = identityRepository.ensureUuid()
-        val pending: PendingOffer
-        mutex.withLock {
-            pending = pendingOffers.remove(callId) ?: return
-            check(current == null) { "another call is already active" }
-            val session = sessionFactory.create()
-            val answerSdp = session.acceptOffer(pending.remoteSdp)
-            val row = dao.findById(callId) ?: return
-            val updated =
-                row.toDomain().copy(state = Call.State.CONNECTING).toEntity()
-            dao.upsert(updated)
-            current = bindSession(callId = callId, peer = pending.peer, session = session, selfUuid = selfUuid)
-            notifier.cancel(callId)
+
+        data class Accepted(
+            val peer: Peer,
+            val answerSdp: String,
+        )
+        val accepted: Accepted? =
+            mutex.withLock {
+                val pending = pendingOffers.remove(callId) ?: return@withLock null
+                pending.timeoutJob?.cancel()
+                check(current == null) { "another call is already active" }
+                val session = sessionFactory.create()
+                val answerSdp = session.acceptOffer(pending.remoteSdp)
+                val row = dao.findById(callId) ?: return@withLock null
+                val updated = row.toDomain().copy(state = Call.State.CONNECTING).toEntity()
+                dao.upsert(updated)
+                current = bindSession(callId = callId, peer = pending.peer, session = session, selfUuid = selfUuid)
+                notifier.cancel(callId)
+                Accepted(pending.peer, answerSdp)
+            }
+        if (accepted != null) {
             runCatching {
                 client.sendCallAnswer(
-                    pending.peer,
-                    CallAnswerDto(callId = callId, fromUuid = selfUuid, sdp = answerSdp),
+                    accepted.peer,
+                    CallAnswerDto(callId = callId, fromUuid = selfUuid, sdp = accepted.answerSdp),
                 )
             }.onFailure {
                 Log.w(TAG, "sendCallAnswer failed", it)
-                tearDown(callId, Call.EndReason.FAILED)
+                mutex.withLock { tearDown(callId, Call.EndReason.FAILED) }
             }
         }
     }
@@ -203,7 +203,7 @@ class CallRepository(
         val selfUuid = identityRepository.ensureUuid()
         val peer: Peer?
         mutex.withLock {
-            val pending = pendingOffers.remove(callId)
+            val pending = pendingOffers[callId]
             peer = pending?.peer ?: current?.peer ?: resolvePeer(callId)
             tearDown(callId, reason)
             notifier.cancel(callId)
@@ -235,41 +235,51 @@ class CallRepository(
     /**
      * Handle a `POST /v1/call/offer`. If we're already on a call, auto-reject
      * with reason `BUSY` and do not store the row. Otherwise persist the
-     * call as `RINGING` / `INCOMING`, stash the offer SDP, and ring the
-     * user via [notifier].
+     * call as `RINGING` / `INCOMING`, stash the offer SDP, ring the user
+     * via [notifier], and schedule a no-answer timeout that mirrors the
+     * caller-side ring timeout (without it, an ignored incoming call would
+     * leave the app stuck "ringing" indefinitely).
      */
     suspend fun applyOffer(
         sender: Peer,
         dto: CallOfferDto,
     ) {
         val selfUuid = identityRepository.ensureUuid()
-        mutex.withLock {
-            if (current != null || pendingOffers.isNotEmpty()) {
-                // Best-effort busy-hangup back to the caller.
-                runCatching {
-                    client.sendCallHangup(
-                        sender,
-                        CallHangupDto(
-                            callId = dto.callId,
-                            fromUuid = selfUuid,
-                            reason = Call.EndReason.BUSY.name,
-                        ),
+        val busy: Boolean =
+            mutex.withLock {
+                if (current != null || pendingOffers.isNotEmpty()) {
+                    return@withLock true
+                }
+                val call =
+                    Call(
+                        id = dto.callId,
+                        peerUuid = sender.uuid,
+                        peerNickname = dto.fromNickname,
+                        direction = Call.Direction.INCOMING,
+                        state = Call.State.RINGING,
+                        startedAt = dto.sentAt,
                     )
-                }.onFailure { Log.w(TAG, "busy-hangup back failed", it) }
-                return
+                dao.upsert(call.toEntity())
+                val pending = PendingOffer(peer = sender, remoteSdp = dto.sdp)
+                pendingOffers[dto.callId] = pending
+                pending.timeoutJob = scheduleRingTimeout(dto.callId)
+                notifier.notifyIncomingCall(call)
+                false
             }
-            val call =
-                Call(
-                    id = dto.callId,
-                    peerUuid = sender.uuid,
-                    peerNickname = dto.fromNickname,
-                    direction = Call.Direction.INCOMING,
-                    state = Call.State.RINGING,
-                    startedAt = dto.sentAt,
+        if (busy) {
+            // Best-effort busy-hangup back to the caller, outside the mutex so
+            // we don't block the call state machine for the duration of the
+            // round-trip.
+            runCatching {
+                client.sendCallHangup(
+                    sender,
+                    CallHangupDto(
+                        callId = dto.callId,
+                        fromUuid = selfUuid,
+                        reason = Call.EndReason.BUSY.name,
+                    ),
                 )
-            dao.upsert(call.toEntity())
-            pendingOffers[dto.callId] = PendingOffer(peer = sender, remoteSdp = dto.sdp)
-            notifier.notifyIncomingCall(call)
+            }.onFailure { Log.w(TAG, "busy-hangup back failed", it) }
         }
     }
 
@@ -322,10 +332,9 @@ class CallRepository(
             val reason =
                 dto.reason?.let { runCatching { Call.EndReason.valueOf(it) }.getOrNull() }
                     ?: Call.EndReason.HANGUP
-            val pending = pendingOffers.remove(dto.callId)
+            val pending = pendingOffers[dto.callId]
             if (pending != null && pending.peer.uuid != sender.uuid) {
                 // Ignore stray hangups from unrelated peers on a pending offer.
-                pendingOffers[dto.callId] = pending
                 return
             }
             val active = current
@@ -425,7 +434,7 @@ class CallRepository(
             runCatching { active.session.close() }.onFailure { Log.w(TAG, "session.close failed", it) }
             current = null
         }
-        pendingOffers.remove(callId)
+        pendingOffers.remove(callId)?.timeoutJob?.cancel()
     }
 
     private suspend fun resolvePeer(callId: String): Peer? {
@@ -440,9 +449,25 @@ class CallRepository(
         )
     }
 
+    /**
+     * Used by both [startCall] (outbound RINGING → NO_ANSWER) and
+     * [applyOffer] (inbound RINGING → NO_ANSWER) to enforce a maximum
+     * ring duration. Returns the launched job so the caller can attach
+     * it to the call's lifecycle for cancellation on acceptance / hangup.
+     */
+    private fun scheduleRingTimeout(callId: String): Job =
+        scope.launch {
+            delay(ringTimeoutMs)
+            val row = dao.findById(callId) ?: return@launch
+            if (row.state == Call.State.RINGING.name) {
+                hangUp(callId, Call.EndReason.NO_ANSWER)
+            }
+        }
+
     private data class PendingOffer(
         val peer: Peer,
         val remoteSdp: String,
+        var timeoutJob: Job? = null,
     )
 
     private data class ActiveCall(

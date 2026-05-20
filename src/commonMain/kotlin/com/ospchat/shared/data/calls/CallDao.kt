@@ -20,14 +20,4 @@ interface CallDao {
      */
     @Query("SELECT * FROM calls WHERE state != 'ENDED' ORDER BY started_at DESC LIMIT 1")
     fun observeActive(): Flow<CallEntity?>
-
-    /**
-     * Full history. Phase 2 will surface this in a dedicated screen; phase 1
-     * just populates the table for forwards compatibility.
-     */
-    @Query("SELECT * FROM calls ORDER BY started_at DESC")
-    fun observeHistory(): Flow<List<CallEntity>>
-
-    @Query("DELETE FROM calls WHERE id = :id")
-    suspend fun delete(id: String)
 }
