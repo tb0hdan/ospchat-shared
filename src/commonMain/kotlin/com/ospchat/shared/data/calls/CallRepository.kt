@@ -98,6 +98,19 @@ class CallRepository(
     // have moved on by then).
     private val pendingOffers = mutableMapOf<String, PendingOffer>()
 
+    // ICE candidates that arrived from the wire *before* the matching offer
+    // POST was processed for the same callId. The caller fires its first
+    // local host candidate the instant `setLocalDescription` returns inside
+    // `createOffer` — POST /v1/call/ice can overtake the in-flight POST
+    // /v1/call/offer on a multi-threaded HTTP server, especially when the
+    // offer handler is slow (DB upsert + ringtone start). Without this
+    // buffer those early candidates hit `pendingOffers[callId] == null` in
+    // [applyIce] and get dropped, costing us the only UDP host candidate
+    // when the rest of the gather is TCP-active (port 9, unconnectable).
+    // Drained into [PendingOffer.pendingIce] by [applyOffer]; expired after
+    // [ringTimeoutMs] if the offer never arrives.
+    private val preOfferIce = mutableMapOf<String, PreOfferIce>()
+
     // ---- Outbound (user-initiated) -----------------------------------------
 
     /**
@@ -291,6 +304,9 @@ class CallRepository(
                         "applyOffer: BUSY callId=${dto.callId} (current=${current?.callId} " +
                             "pending=${pendingOffers.keys})",
                     )
+                    // Caller is being rejected — discard any ICE we may have
+                    // buffered for this callId so it doesn't linger until TTL.
+                    preOfferIce.remove(dto.callId)?.timeoutJob?.cancel()
                     return@withLock true
                 }
                 val call =
@@ -304,6 +320,28 @@ class CallRepository(
                     )
                 dao.upsert(call.toEntity())
                 val pending = PendingOffer(peer = sender, remoteSdp = dto.sdp)
+                // Drain pre-offer ICE candidates (POSTed by the caller before
+                // its offer POST landed on us — see [preOfferIce]). Sender
+                // must match the offer's sender; otherwise discard as
+                // unrelated/spoofed.
+                val carried = preOfferIce.remove(dto.callId)
+                carried?.timeoutJob?.cancel()
+                if (carried != null) {
+                    if (carried.senderUuid == sender.uuid) {
+                        pending.pendingIce += carried.candidates
+                        Log.d(
+                            TAG,
+                            "applyOffer: drained ${carried.candidates.size} pre-offer ICE " +
+                                "callId=${dto.callId}",
+                        )
+                    } else {
+                        Log.w(
+                            TAG,
+                            "applyOffer: pre-offer sender mismatch dto=${sender.uuid} " +
+                                "buffered=${carried.senderUuid} — discarding ${carried.candidates.size} ICE",
+                        )
+                    }
+                }
                 pendingOffers[dto.callId] = pending
                 pending.timeoutJob = scheduleRingTimeout(dto.callId)
                 notifier.notifyIncomingCall(call)
@@ -413,9 +451,43 @@ class CallRepository(
             }
             val pending = pendingOffers[dto.callId]
             if (pending == null) {
-                Log.w(
+                // Offer for this callId hasn't been processed yet — stash
+                // until applyOffer arrives. See [preOfferIce].
+                val existing = preOfferIce[dto.callId]
+                if (existing == null) {
+                    val entry =
+                        PreOfferIce(
+                            senderUuid = sender.uuid,
+                            candidates = mutableListOf(dto.toCandidate()),
+                        )
+                    entry.timeoutJob =
+                        scope.launch {
+                            delay(ringTimeoutMs)
+                            mutex.withLock { preOfferIce.remove(dto.callId) }
+                        }
+                    preOfferIce[dto.callId] = entry
+                    Log.d(TAG, "applyIce: buffered (pre-offer) callId=${dto.callId} bufferSize=1")
+                    return
+                }
+                if (existing.senderUuid != sender.uuid) {
+                    Log.w(
+                        TAG,
+                        "applyIce: pre-offer sender mismatch dto=${sender.uuid} " +
+                            "buffered=${existing.senderUuid} — dropping",
+                    )
+                    return
+                }
+                if (existing.candidates.size >= PRE_OFFER_ICE_CAP) {
+                    Log.w(
+                        TAG,
+                        "applyIce: pre-offer buffer at cap ($PRE_OFFER_ICE_CAP) for callId=${dto.callId} — dropping",
+                    )
+                    return
+                }
+                existing.candidates += dto.toCandidate()
+                Log.d(
                     TAG,
-                    "applyIce: no active session and no pending offer for callId=${dto.callId} — dropping",
+                    "applyIce: buffered (pre-offer) callId=${dto.callId} bufferSize=${existing.candidates.size}",
                 )
                 return
             }
@@ -576,6 +648,7 @@ class CallRepository(
             current = null
         }
         pendingOffers.remove(callId)?.timeoutJob?.cancel()
+        preOfferIce.remove(callId)?.timeoutJob?.cancel()
     }
 
     private suspend fun resolvePeer(callId: String): Peer? {
@@ -615,6 +688,12 @@ class CallRepository(
         val pendingIce: MutableList<AudioCallSession.IceCandidate> = mutableListOf(),
     )
 
+    private data class PreOfferIce(
+        val senderUuid: String,
+        val candidates: MutableList<AudioCallSession.IceCandidate>,
+        var timeoutJob: Job? = null,
+    )
+
     private data class ActiveCall(
         val callId: String,
         val peer: Peer,
@@ -633,5 +712,13 @@ class CallRepository(
          * (~30s) so the user doesn't sit watching "Calling…" forever.
          */
         const val DEFAULT_RING_TIMEOUT_MS = 30_000L
+
+        /**
+         * Per-callId cap on the pre-offer ICE buffer. A well-behaved peer
+         * trickles a handful of host candidates; anything past this is either
+         * runaway gather (unlikely on Android/Desktop LAN gather) or a
+         * malicious peer trying to use us as memory. Drop the rest.
+         */
+        const val PRE_OFFER_ICE_CAP = 64
     }
 }
