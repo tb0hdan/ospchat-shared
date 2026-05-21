@@ -170,10 +170,11 @@ class CallRepository(
         )
         val accepted: Accepted? =
             mutex.withLock {
-                val pending = pendingOffers.remove(callId) ?: run {
-                    Log.w(TAG, "acceptCall: no pending offer for callId=$callId")
-                    return@withLock null
-                }
+                val pending =
+                    pendingOffers.remove(callId) ?: run {
+                        Log.w(TAG, "acceptCall: no pending offer for callId=$callId")
+                        return@withLock null
+                    }
                 pending.timeoutJob?.cancel()
                 check(current == null) { "another call is already active" }
                 val session = sessionFactory.create()
