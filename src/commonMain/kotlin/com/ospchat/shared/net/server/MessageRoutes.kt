@@ -26,6 +26,7 @@ import com.ospchat.shared.net.dto.IncomingMessageDto
 import com.ospchat.shared.net.dto.InfoDto
 import com.ospchat.shared.net.dto.ReactionDto
 import com.ospchat.shared.net.dto.ReadReceiptDto
+import com.ospchat.shared.util.Log
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
@@ -156,24 +157,45 @@ fun Routing.installMessageRoutes(
             route("/call") {
                 post("/offer") {
                     val dto = call.receive<CallOfferDto>()
+                    Log.d(
+                        ROUTES_TAG,
+                        "RX /v1/call/offer from=${call.request.origin.remoteAddress} " +
+                            "fromUuid=${dto.fromUuid} callId=${dto.callId} sdpLen=${dto.sdp.length}",
+                    )
                     val known = call.verifiedPeerOrRespond(dto.fromUuid, discoveryRepository) ?: return@post
                     callRepository.applyOffer(known, dto)
                     call.respond(HttpStatusCode.Accepted)
                 }
                 post("/answer") {
                     val dto = call.receive<CallAnswerDto>()
+                    Log.d(
+                        ROUTES_TAG,
+                        "RX /v1/call/answer from=${call.request.origin.remoteAddress} " +
+                            "fromUuid=${dto.fromUuid} callId=${dto.callId} sdpLen=${dto.sdp.length}",
+                    )
                     val known = call.verifiedPeerOrRespond(dto.fromUuid, discoveryRepository) ?: return@post
                     callRepository.applyAnswer(known, dto)
                     call.respond(HttpStatusCode.Accepted)
                 }
                 post("/ice") {
                     val dto = call.receive<CallIceDto>()
+                    Log.d(
+                        ROUTES_TAG,
+                        "RX /v1/call/ice from=${call.request.origin.remoteAddress} " +
+                            "fromUuid=${dto.fromUuid} callId=${dto.callId} mid=${dto.sdpMid} " +
+                            "mline=${dto.sdpMLineIndex} cand=${dto.candidate}",
+                    )
                     val known = call.verifiedPeerOrRespond(dto.fromUuid, discoveryRepository) ?: return@post
                     callRepository.applyIce(known, dto)
                     call.respond(HttpStatusCode.Accepted)
                 }
                 post("/hangup") {
                     val dto = call.receive<CallHangupDto>()
+                    Log.d(
+                        ROUTES_TAG,
+                        "RX /v1/call/hangup from=${call.request.origin.remoteAddress} " +
+                            "fromUuid=${dto.fromUuid} callId=${dto.callId} reason=${dto.reason}",
+                    )
                     val known = call.verifiedPeerOrRespond(dto.fromUuid, discoveryRepository) ?: return@post
                     callRepository.applyHangup(known, dto)
                     call.respond(HttpStatusCode.Accepted)
@@ -215,6 +237,8 @@ fun Routing.installMessageRoutes(
         }
     }
 }
+
+private const val ROUTES_TAG = "MessageRoutes"
 
 private suspend fun ApplicationCall.verifiedPeerOrRespond(
     fromUuid: String,

@@ -112,6 +112,7 @@ class CallRepository(
         val selfNickname = identityRepository.nicknameFlow.first().orEmpty()
         val callId = Uuid.random().toString()
         val startedAt = Clock.System.now().toEpochMilliseconds()
+        Log.d(TAG, "startCall callId=$callId peer=${peer.uuid}@${peer.host}:${peer.port}")
 
         // Hold the mutex only for in-memory + DB state mutation; HTTP sends
         // are dispatched outside the lock so they can't block the call
@@ -122,6 +123,7 @@ class CallRepository(
                 check(current == null) { "another call is already active" }
                 val session = sessionFactory.create()
                 val sdp = session.createOffer()
+                Log.d(TAG, "createOffer ok callId=$callId sdpLen=${sdp.length}")
                 val call =
                     Call(
                         id = callId,
@@ -144,9 +146,10 @@ class CallRepository(
                     sentAt = startedAt,
                 )
             }
+        Log.d(TAG, "POST /v1/call/offer → ${peer.uuid}@${peer.host}:${peer.port} callId=$callId")
         runCatching { client.sendCallOffer(peer, offerDto) }
             .onFailure {
-                Log.w(TAG, "sendCallOffer failed", it)
+                Log.w(TAG, "sendCallOffer failed callId=$callId", it)
                 mutex.withLock { tearDown(callId, Call.EndReason.FAILED) }
             }
         return callId
@@ -159,6 +162,7 @@ class CallRepository(
      */
     suspend fun acceptCall(callId: String) {
         val selfUuid = identityRepository.ensureUuid()
+        Log.d(TAG, "acceptCall callId=$callId")
 
         data class Accepted(
             val peer: Peer,
@@ -166,18 +170,31 @@ class CallRepository(
         )
         val accepted: Accepted? =
             mutex.withLock {
-                val pending = pendingOffers.remove(callId) ?: return@withLock null
+                val pending = pendingOffers.remove(callId) ?: run {
+                    Log.w(TAG, "acceptCall: no pending offer for callId=$callId")
+                    return@withLock null
+                }
                 pending.timeoutJob?.cancel()
                 check(current == null) { "another call is already active" }
                 val session = sessionFactory.create()
                 val answerSdp = session.acceptOffer(pending.remoteSdp)
+                Log.d(
+                    TAG,
+                    "acceptOffer ok callId=$callId remoteSdpLen=${pending.remoteSdp.length} " +
+                        "answerSdpLen=${answerSdp.length} bufferedIce=${pending.pendingIce.size}",
+                )
                 // Drain ICE candidates that arrived while we were ringing.
                 // `acceptOffer` has set the remote description, so libwebrtc
                 // is ready to accept them. See [applyIce] for why these were
                 // buffered instead of dropped.
-                for (candidate in pending.pendingIce) {
+                for ((idx, candidate) in pending.pendingIce.withIndex()) {
+                    Log.d(
+                        TAG,
+                        "drain remote ICE callId=$callId idx=$idx mid=${candidate.sdpMid} " +
+                            "mline=${candidate.sdpMLineIndex} cand=${candidate.candidate}",
+                    )
                     runCatching { session.addRemoteIce(candidate) }
-                        .onFailure { Log.w(TAG, "addRemoteIce (buffered) failed", it) }
+                        .onFailure { Log.w(TAG, "addRemoteIce (buffered) failed callId=$callId", it) }
                 }
                 val row = dao.findById(callId) ?: return@withLock null
                 val updated = row.toDomain().copy(state = Call.State.CONNECTING).toEntity()
@@ -187,13 +204,17 @@ class CallRepository(
                 Accepted(pending.peer, answerSdp)
             }
         if (accepted != null) {
+            Log.d(
+                TAG,
+                "POST /v1/call/answer → ${accepted.peer.uuid}@${accepted.peer.host}:${accepted.peer.port} callId=$callId",
+            )
             runCatching {
                 client.sendCallAnswer(
                     accepted.peer,
                     CallAnswerDto(callId = callId, fromUuid = selfUuid, sdp = accepted.answerSdp),
                 )
             }.onFailure {
-                Log.w(TAG, "sendCallAnswer failed", it)
+                Log.w(TAG, "sendCallAnswer failed callId=$callId", it)
                 mutex.withLock { tearDown(callId, Call.EndReason.FAILED) }
             }
         }
@@ -209,6 +230,7 @@ class CallRepository(
         reason: Call.EndReason = Call.EndReason.HANGUP,
     ) {
         val selfUuid = identityRepository.ensureUuid()
+        Log.d(TAG, "hangUp callId=$callId reason=$reason")
         val peer: Peer?
         mutex.withLock {
             val pending = pendingOffers[callId]
@@ -217,12 +239,15 @@ class CallRepository(
             notifier.cancel(callId)
         }
         if (peer != null) {
+            Log.d(TAG, "POST /v1/call/hangup → ${peer.uuid}@${peer.host}:${peer.port} callId=$callId reason=$reason")
             runCatching {
                 client.sendCallHangup(
                     peer,
                     CallHangupDto(callId = callId, fromUuid = selfUuid, reason = reason.name),
                 )
-            }.onFailure { Log.w(TAG, "sendCallHangup failed", it) }
+            }.onFailure { Log.w(TAG, "sendCallHangup failed callId=$callId", it) }
+        } else {
+            Log.w(TAG, "hangUp: no peer to notify callId=$callId")
         }
     }
 
@@ -253,9 +278,18 @@ class CallRepository(
         dto: CallOfferDto,
     ) {
         val selfUuid = identityRepository.ensureUuid()
+        Log.d(
+            TAG,
+            "applyOffer ← ${sender.uuid}@${sender.host}:${sender.port} callId=${dto.callId} sdpLen=${dto.sdp.length}",
+        )
         val busy: Boolean =
             mutex.withLock {
                 if (current != null || pendingOffers.isNotEmpty()) {
+                    Log.w(
+                        TAG,
+                        "applyOffer: BUSY callId=${dto.callId} (current=${current?.callId} " +
+                            "pending=${pendingOffers.keys})",
+                    )
                     return@withLock true
                 }
                 val call =
@@ -272,6 +306,7 @@ class CallRepository(
                 pendingOffers[dto.callId] = pending
                 pending.timeoutJob = scheduleRingTimeout(dto.callId)
                 notifier.notifyIncomingCall(call)
+                Log.d(TAG, "applyOffer: stored pending offer callId=${dto.callId}, ringing user")
                 false
             }
         if (busy) {
@@ -287,7 +322,7 @@ class CallRepository(
                         reason = Call.EndReason.BUSY.name,
                     ),
                 )
-            }.onFailure { Log.w(TAG, "busy-hangup back failed", it) }
+            }.onFailure { Log.w(TAG, "busy-hangup back failed callId=${dto.callId}", it) }
         }
     }
 
@@ -300,11 +335,32 @@ class CallRepository(
         sender: Peer,
         dto: CallAnswerDto,
     ) {
+        Log.d(
+            TAG,
+            "applyAnswer ← ${sender.uuid}@${sender.host}:${sender.port} callId=${dto.callId} sdpLen=${dto.sdp.length}",
+        )
         mutex.withLock {
-            val active = current ?: return
-            if (active.callId != dto.callId) return
-            if (active.peer.uuid != sender.uuid) return
+            val active = current
+            if (active == null) {
+                Log.w(TAG, "applyAnswer: no active session, dropping callId=${dto.callId}")
+                return
+            }
+            if (active.callId != dto.callId) {
+                Log.w(
+                    TAG,
+                    "applyAnswer: callId mismatch dto=${dto.callId} active=${active.callId} — dropping",
+                )
+                return
+            }
+            if (active.peer.uuid != sender.uuid) {
+                Log.w(
+                    TAG,
+                    "applyAnswer: sender mismatch dto=${sender.uuid} active=${active.peer.uuid} — dropping",
+                )
+                return
+            }
             active.session.setRemoteAnswer(dto.sdp)
+            Log.d(TAG, "applyAnswer: setRemoteAnswer ok callId=${dto.callId}")
             val row = dao.findById(dto.callId) ?: return
             if (row.state == Call.State.RINGING.name) {
                 dao.upsert(row.toDomain().copy(state = Call.State.CONNECTING).toEntity())
@@ -327,18 +383,54 @@ class CallRepository(
         sender: Peer,
         dto: CallIceDto,
     ) {
+        Log.d(
+            TAG,
+            "applyIce ← ${sender.uuid}@${sender.host}:${sender.port} callId=${dto.callId} " +
+                "mid=${dto.sdpMid} mline=${dto.sdpMLineIndex} cand=${dto.candidate}",
+        )
         mutex.withLock {
             val active = current
             if (active != null) {
-                if (active.callId != dto.callId) return
-                if (active.peer.uuid != sender.uuid) return
+                if (active.callId != dto.callId) {
+                    Log.w(
+                        TAG,
+                        "applyIce: callId mismatch dto=${dto.callId} active=${active.callId} — dropping",
+                    )
+                    return
+                }
+                if (active.peer.uuid != sender.uuid) {
+                    Log.w(
+                        TAG,
+                        "applyIce: sender mismatch dto=${sender.uuid} active=${active.peer.uuid} — dropping",
+                    )
+                    return
+                }
                 runCatching { active.session.addRemoteIce(dto.toCandidate()) }
-                    .onFailure { Log.w(TAG, "addRemoteIce failed", it) }
+                    .onSuccess { Log.d(TAG, "applyIce: addRemoteIce ok (live) callId=${dto.callId}") }
+                    .onFailure { Log.w(TAG, "addRemoteIce failed callId=${dto.callId}", it) }
                 return
             }
-            val pending = pendingOffers[dto.callId] ?: return
-            if (pending.peer.uuid != sender.uuid) return
+            val pending = pendingOffers[dto.callId]
+            if (pending == null) {
+                Log.w(
+                    TAG,
+                    "applyIce: no active session and no pending offer for callId=${dto.callId} — dropping",
+                )
+                return
+            }
+            if (pending.peer.uuid != sender.uuid) {
+                Log.w(
+                    TAG,
+                    "applyIce: pending-offer sender mismatch dto=${sender.uuid} " +
+                        "pending=${pending.peer.uuid} — dropping",
+                )
+                return
+            }
             pending.pendingIce += dto.toCandidate()
+            Log.d(
+                TAG,
+                "applyIce: buffered (pending offer) callId=${dto.callId} bufferSize=${pending.pendingIce.size}",
+            )
         }
     }
 
@@ -351,17 +443,30 @@ class CallRepository(
         sender: Peer,
         dto: CallHangupDto,
     ) {
+        Log.d(
+            TAG,
+            "applyHangup ← ${sender.uuid}@${sender.host}:${sender.port} callId=${dto.callId} reason=${dto.reason}",
+        )
         mutex.withLock {
             val reason =
                 dto.reason?.let { runCatching { Call.EndReason.valueOf(it) }.getOrNull() }
                     ?: Call.EndReason.HANGUP
             val pending = pendingOffers[dto.callId]
             if (pending != null && pending.peer.uuid != sender.uuid) {
+                Log.w(
+                    TAG,
+                    "applyHangup: pending-offer sender mismatch dto=${sender.uuid} " +
+                        "pending=${pending.peer.uuid} — ignoring",
+                )
                 // Ignore stray hangups from unrelated peers on a pending offer.
                 return
             }
             val active = current
             if (active != null && active.callId == dto.callId && active.peer.uuid != sender.uuid) {
+                Log.w(
+                    TAG,
+                    "applyHangup: active sender mismatch dto=${sender.uuid} active=${active.peer.uuid} — ignoring",
+                )
                 return
             }
             tearDown(dto.callId, reason)
@@ -380,13 +485,24 @@ class CallRepository(
         val iceJob =
             scope.launch {
                 session.localIceCandidates.collect { candidate ->
+                    Log.d(
+                        TAG,
+                        "local ICE callId=$callId mid=${candidate.sdpMid} " +
+                            "mline=${candidate.sdpMLineIndex} cand=${candidate.candidate}",
+                    )
+                    Log.d(
+                        TAG,
+                        "POST /v1/call/ice → ${peer.uuid}@${peer.host}:${peer.port} callId=$callId",
+                    )
                     runCatching { client.sendCallIce(peer, candidate.toDto(callId, selfUuid)) }
-                        .onFailure { Log.w(TAG, "sendCallIce failed", it) }
+                        .onSuccess { Log.d(TAG, "sendCallIce ok callId=$callId") }
+                        .onFailure { Log.w(TAG, "sendCallIce failed callId=$callId", it) }
                 }
             }
         val stateJob =
             scope.launch {
                 session.state.collect { sessionState ->
+                    Log.d(TAG, "session state callId=$callId → $sessionState")
                     onSessionStateChange(callId, sessionState)
                 }
             }
@@ -439,6 +555,7 @@ class CallRepository(
         callId: String,
         reason: Call.EndReason,
     ) {
+        Log.d(TAG, "tearDown callId=$callId reason=$reason")
         val row = dao.findById(callId)
         if (row != null && row.state != Call.State.ENDED.name) {
             val now = Clock.System.now().toEpochMilliseconds()
@@ -454,7 +571,7 @@ class CallRepository(
             active.iceForwarderJob.cancel()
             active.stateObserverJob.cancel()
             active.ringTimeoutJob?.cancel()
-            runCatching { active.session.close() }.onFailure { Log.w(TAG, "session.close failed", it) }
+            runCatching { active.session.close() }.onFailure { Log.w(TAG, "session.close failed callId=$callId", it) }
             current = null
         }
         pendingOffers.remove(callId)?.timeoutJob?.cancel()
