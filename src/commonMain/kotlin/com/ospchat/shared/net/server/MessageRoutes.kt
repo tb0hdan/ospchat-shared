@@ -27,6 +27,7 @@ import com.ospchat.shared.net.dto.InfoDto
 import com.ospchat.shared.net.dto.ReactionDto
 import com.ospchat.shared.net.dto.ReadReceiptDto
 import com.ospchat.shared.util.Log
+import com.ospchat.shared.util.requireSafeFileComponent
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
@@ -81,6 +82,11 @@ fun Routing.installMessageRoutes(
         }
         post("/messages") {
             val dto = call.receive<IncomingMessageDto>()
+            // Reject early: dto.id is the on-disk filename for the eventual
+            // attachment download (see MessageRepository.downloadAttachment).
+            // Bad input here would later throw inside fire-and-forget code
+            // and leave an orphan Room row. See docs/SECURITY.md F1.
+            requireSafeFileComponent(dto.id, "id")
             val known = call.verifiedPeerOrRespond(dto.fromUuid, discoveryRepository) ?: return@post
             messageRepository.receive(known, dto)
             call.respond(HttpStatusCode.Accepted)
@@ -115,6 +121,9 @@ fun Routing.installMessageRoutes(
                         HttpStatusCode.BadRequest,
                         ErrorDto(ErrorCodes.BAD_REQUEST, "missing messageId"),
                     )
+            // Validate before any side effects so a malformed id can never
+            // probe disk for /v1/attachments/../something. See docs/SECURITY.md F1.
+            requireSafeFileComponent(messageId, "messageId")
             call.verifiedRequestingPeerOrRespond(discoveryRepository) ?: return@get
             val bytes = attachmentStore.readBytes(messageId)
             if (bytes == null) {
@@ -157,6 +166,11 @@ fun Routing.installMessageRoutes(
             route("/call") {
                 post("/offer") {
                     val dto = call.receive<CallOfferDto>()
+                    // Cap before the SDP ever reaches the libwebrtc JNI parser.
+                    // See docs/SECURITY.md F3.
+                    require(dto.sdp.length <= MAX_SDP_CHARS) {
+                        "sdp exceeds $MAX_SDP_CHARS chars"
+                    }
                     Log.d(
                         ROUTES_TAG,
                         "RX /v1/call/offer from=${call.request.origin.remoteAddress} " +
@@ -168,6 +182,9 @@ fun Routing.installMessageRoutes(
                 }
                 post("/answer") {
                     val dto = call.receive<CallAnswerDto>()
+                    require(dto.sdp.length <= MAX_SDP_CHARS) {
+                        "sdp exceeds $MAX_SDP_CHARS chars"
+                    }
                     Log.d(
                         ROUTES_TAG,
                         "RX /v1/call/answer from=${call.request.origin.remoteAddress} " +
@@ -179,6 +196,20 @@ fun Routing.installMessageRoutes(
                 }
                 post("/ice") {
                     val dto = call.receive<CallIceDto>()
+                    // Per-field caps on every string the JNI candidate parser
+                    // will see. A legitimate trickled candidate is < 256 chars;
+                    // 4 KiB leaves slack for future extension. sdpMid is a
+                    // short label like "audio". See docs/SECURITY.md F3.
+                    require(dto.candidate.length <= MAX_ICE_CANDIDATE_CHARS) {
+                        "candidate exceeds $MAX_ICE_CANDIDATE_CHARS chars"
+                    }
+                    val mid = dto.sdpMid
+                    require(mid == null || mid.length <= MAX_ICE_MID_CHARS) {
+                        "sdpMid exceeds $MAX_ICE_MID_CHARS chars"
+                    }
+                    require(dto.sdpMLineIndex in 0..MAX_ICE_MLINE_INDEX) {
+                        "sdpMLineIndex out of range"
+                    }
                     Log.d(
                         ROUTES_TAG,
                         "RX /v1/call/ice from=${call.request.origin.remoteAddress} " +
@@ -222,6 +253,13 @@ fun Routing.installMessageRoutes(
                 }
                 post("/sync") {
                     val req = call.receive<GroupSyncRequestDto>()
+                    // Cap cursors per request: each cursor costs a DB lookup
+                    // plus per-group history scan; an unbounded cursor list
+                    // amplifies one POST into N round trips. See
+                    // docs/SECURITY.md D5.
+                    require(req.cursors.size <= MAX_CURSORS_PER_SYNC) {
+                        "too many cursors (>$MAX_CURSORS_PER_SYNC)"
+                    }
                     call.verifiedPeerOrRespond(req.fromUuid, discoveryRepository) ?: return@post
                     val response = groupSyncer.buildResponse(req)
                     call.respond(response)
@@ -239,6 +277,32 @@ fun Routing.installMessageRoutes(
 }
 
 private const val ROUTES_TAG = "MessageRoutes"
+
+/**
+ * Upper bound on a peer-supplied SDP body (offer / answer). A legitimate
+ * single-audio-stream WebRTC SDP is ~2-5 KiB even with several inline ICE
+ * candidates; 64 KiB is several orders of magnitude past that yet still
+ * far below anything that would risk JNI heap pressure. Cf.
+ * docs/SECURITY.md F3.
+ */
+private const val MAX_SDP_CHARS = 64 * 1024
+
+/** Upper bound on a single trickled ICE candidate string. See F3. */
+private const val MAX_ICE_CANDIDATE_CHARS = 4 * 1024
+
+/** Upper bound on the sdpMid label (e.g. "audio"). See F3. */
+private const val MAX_ICE_MID_CHARS = 64
+
+/** Sanity bound on sdpMLineIndex — we only ever negotiate a single m=audio. */
+private const val MAX_ICE_MLINE_INDEX = 16
+
+/**
+ * Cap on the number of cursors in a single `/v1/groups/sync` request.
+ * A legitimate peer's cursor count is bounded by the groups they share
+ * with us; 64 is generous. Above that, reject 400 to avoid amplifying
+ * one POST into a many-group history scan. See docs/SECURITY.md D5.
+ */
+private const val MAX_CURSORS_PER_SYNC = 64
 
 private suspend fun ApplicationCall.verifiedPeerOrRespond(
     fromUuid: String,

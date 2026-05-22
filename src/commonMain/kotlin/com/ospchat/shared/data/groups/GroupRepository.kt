@@ -190,6 +190,13 @@ class GroupRepository(
      * updated when [fromUuid] equals the group's creator AND the snapshot
      * is newer than what we have. The group row itself (name, kind) is
      * authoritative from the creator only.
+     *
+     * On *first sighting* of a group we additionally require the creator
+     * to already be in our contacts. Without that gate, any LAN peer
+     * could push us into arbitrary groups (auto-naming, auto-membership)
+     * just by POSTing `/v1/groups/membership` — see docs/SECURITY.md D7.
+     * Established groups continue to update normally so a creator can
+     * still rename / add members.
      */
     suspend fun applySnapshot(
         fromUuid: String,
@@ -200,6 +207,9 @@ class GroupRepository(
             // First sighting: only adopt if the sender is the creator
             // (otherwise we'd accept rogue groups from arbitrary peers).
             if (fromUuid != snapshot.creatorUuid) return
+            // ...and the creator must be in our contacts. Strangers can't
+            // pollute our DB with auto-created groups. See D7.
+            if (peerDao.findByUuid(fromUuid)?.isContact != true) return
             groupDao.upsert(snapshot.toEntity(lastReadAt = 0L))
             groupDao.replaceMembers(snapshot.id, snapshot.toMemberEntities())
             return

@@ -150,8 +150,15 @@ class ReactionRepository(
         }
     }
 
-    /** All reactions on every message in [groupId]; used by catch-up sync. */
-    suspend fun reactionsSnapshotForGroup(groupId: String): List<Reaction> = dao.snapshotForGroup(groupId).map(ReactionEntity::toDomain)
+    /**
+     * Most-recent [limit] reactions on messages in [groupId]; used by
+     * catch-up sync. Caller bounds the size to keep the sync response
+     * out of OOM territory (see docs/SECURITY.md D5).
+     */
+    suspend fun reactionsSnapshotForGroup(
+        groupId: String,
+        limit: Int,
+    ): List<Reaction> = dao.snapshotForGroup(groupId, limit).map(ReactionEntity::toDomain)
 
     private suspend fun resolvePeer(memberUuid: String): Peer? {
         discoveryRepository?.findPeer(memberUuid)?.let { return it }

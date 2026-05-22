@@ -1,6 +1,8 @@
 package com.ospchat.shared.data.discovery
 
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 
 /**
  * Platform-agnostic mDNS / DNS-SD peer discovery. Android backs it with
@@ -40,4 +42,64 @@ interface PeerDiscoveryService {
      * way to force re-resolution.
      */
     fun forgetPeer(uuid: String)
+}
+
+/**
+ * Hard cap on the size of [PeerDiscoveryService.peers]. Existing entries
+ * can always be refreshed (a peer's port/nickname update); new peers are
+ * silently dropped once the snapshot is full. A LAN with this many
+ * legitimate OSPChat peers is unrealistic — the cap exists to bound the
+ * map under an mDNS-flood attack. See docs/SECURITY.md D3.
+ */
+const val MAX_PEERS: Int = 256
+
+/** Outcome of a [protectedInsert] call. */
+enum class PeerInsertResult {
+    /** Insert / update was applied to the snapshot. */
+    ACCEPTED,
+
+    /** Dropped because the snapshot was already at [MAX_PEERS]. D3. */
+    DROPPED_AT_CAP,
+
+    /**
+     * Dropped because an entry for the same uuid already exists at a
+     * different host — likely an attacker on the LAN advertising the same
+     * uuid TXT from a different IP to hijack the victim's identity. The
+     * legitimate IP-change path goes through `serviceRemoved` / `forgetPeer`
+     * first, which empties the entry before the new resolve lands. F9.
+     */
+    DROPPED_HIJACK,
+}
+
+/**
+ * Atomically insert [uuid]→[peer] into the snapshot with the combined
+ * D3 cap and F9 identity-hijack defence. Updates of an existing uuid at
+ * the SAME host (typical: port or nickname changed across restart) are
+ * always allowed. See docs/SECURITY.md D3 / F9.
+ */
+fun MutableStateFlow<Map<String, Peer>>.protectedInsert(
+    uuid: String,
+    peer: Peer,
+    max: Int = MAX_PEERS,
+): PeerInsertResult {
+    var result = PeerInsertResult.ACCEPTED
+    update { current ->
+        val existing = current[uuid]
+        when {
+            existing != null && existing.host != peer.host -> {
+                result = PeerInsertResult.DROPPED_HIJACK
+                current
+            }
+
+            existing == null && current.size >= max -> {
+                result = PeerInsertResult.DROPPED_AT_CAP
+                current
+            }
+
+            else -> {
+                current + (uuid to peer)
+            }
+        }
+    }
+    return result
 }

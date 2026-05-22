@@ -119,7 +119,6 @@ class JmDnsPeerDiscovery : PeerDiscoveryService {
                 if (uuid.isBlank() || uuid == selfUuid) return
                 val host = info.inetAddresses.firstOrNull()?.hostAddress ?: return
 
-                nameToUuid[event.name] = uuid
                 val peer =
                     Peer(
                         uuid = uuid,
@@ -127,7 +126,23 @@ class JmDnsPeerDiscovery : PeerDiscoveryService {
                         host = host,
                         port = info.port,
                     )
-                _peers.update { it + (uuid to peer) }
+                when (val result = _peers.protectedInsert(uuid, peer)) {
+                    PeerInsertResult.ACCEPTED -> {
+                        nameToUuid[event.name] = uuid
+                    }
+
+                    PeerInsertResult.DROPPED_AT_CAP -> {
+                        Log.w(TAG, "peer cap reached ($MAX_PEERS); dropping name=${event.name}")
+                    }
+
+                    PeerInsertResult.DROPPED_HIJACK -> {
+                        Log.w(
+                            TAG,
+                            "hijack guard: refusing to overwrite uuid=$uuid (existing host) " +
+                                "with name=${event.name}@$host — ignoring; result=$result",
+                        )
+                    }
+                }
             }
         }
 

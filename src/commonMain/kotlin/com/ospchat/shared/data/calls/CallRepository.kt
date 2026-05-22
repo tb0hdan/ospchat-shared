@@ -455,6 +455,20 @@ class CallRepository(
                 // until applyOffer arrives. See [preOfferIce].
                 val existing = preOfferIce[dto.callId]
                 if (existing == null) {
+                    // Global cap on distinct callIds we'll buffer. The
+                    // per-callId cap (PRE_OFFER_ICE_CAP) bounded each entry,
+                    // but the *number* of entries was unbounded — a peer
+                    // spamming /v1/call/ice with random callIds could pin
+                    // O(MB) of heap + one coroutine per callId for
+                    // ringTimeoutMs. See docs/SECURITY.md D4.
+                    if (preOfferIce.size >= PRE_OFFER_GLOBAL_CAP) {
+                        Log.w(
+                            TAG,
+                            "applyIce: pre-offer global cap ($PRE_OFFER_GLOBAL_CAP) reached — " +
+                                "dropping callId=${dto.callId}",
+                        )
+                        return
+                    }
                     val entry =
                         PreOfferIce(
                             senderUuid = sender.uuid,
@@ -720,5 +734,14 @@ class CallRepository(
          * malicious peer trying to use us as memory. Drop the rest.
          */
         const val PRE_OFFER_ICE_CAP = 64
+
+        /**
+         * Global cap on the number of distinct callIds buffered in
+         * [preOfferIce]. The expected steady state is 0 (no inbound offer
+         * pending) or 1 (a fresh offer is racing its ICE); 32 leaves slack
+         * for misbehaving peers without enabling memory exhaustion. See
+         * docs/SECURITY.md D4.
+         */
+        const val PRE_OFFER_GLOBAL_CAP = 32
     }
 }

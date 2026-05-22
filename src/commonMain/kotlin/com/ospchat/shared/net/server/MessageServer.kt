@@ -14,8 +14,12 @@ import com.ospchat.shared.data.peers.PeerAvatarSync
 import com.ospchat.shared.data.reactions.ReactionRepository
 import com.ospchat.shared.net.dto.ErrorDto
 import com.ospchat.shared.util.Log
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
+import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationCallPipeline
+import io.ktor.server.application.call
 import io.ktor.server.application.install
 import io.ktor.server.cio.CIO
 import io.ktor.server.engine.ApplicationEngine
@@ -23,6 +27,9 @@ import io.ktor.server.engine.embeddedServer
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
+import io.ktor.server.request.contentLength
+import io.ktor.server.request.httpMethod
+import io.ktor.server.request.path
 import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
 
@@ -103,21 +110,9 @@ class MessageServer(
     ): Int? {
         val server =
             embeddedServer(CIO, port = port, host = "0.0.0.0") {
+                installRequestSizeCap(MAX_REQUEST_BYTES)
                 install(ContentNegotiation) { json() }
-                install(StatusPages) {
-                    exception<BadRequestException> { call, cause ->
-                        call.respond(
-                            HttpStatusCode.BadRequest,
-                            ErrorDto(error = ErrorCodes.BAD_REQUEST, detail = cause.message),
-                        )
-                    }
-                    exception<Throwable> { call, cause ->
-                        call.respond(
-                            HttpStatusCode.InternalServerError,
-                            ErrorDto(error = ErrorCodes.INTERNAL_ERROR, detail = cause.message),
-                        )
-                    }
-                }
+                installPeerStatusPages()
                 routing {
                     installMessageRoutes(
                         identity = identity,
@@ -201,5 +196,98 @@ class MessageServer(
     private companion object {
         const val TAG = "MessageServer"
         const val STOP_TIMEOUT_MS = 1_000L
+
+        /**
+         * Hard cap on Content-Length for any POST. See docs/SECURITY.md D1.
+         * The largest legitimate body is a group snapshot or a group-sync
+         * response, both well under this — bump only if the protocol grows
+         * larger DTOs.
+         */
+        const val MAX_REQUEST_BYTES = 1L * 1024 * 1024
+    }
+}
+
+private const val SERVER_TAG = "MessageServer"
+
+/**
+ * Install the peer protocol's StatusPages policy. Three exception types
+ * get explicit handling:
+ *
+ *  - [BadRequestException]: Ktor's content-negotiation parse failures.
+ *    The message ("Failed to convert request body to class X: missing
+ *    field Y") is intentionally surfaced so a peer with a malformed
+ *    request can tell why it was rejected.
+ *  - [IllegalArgumentException]: thrown by our own `require()` /
+ *    `requireSafeFileComponent` / ImageBounds checks. Messages are
+ *    deliberate caller-facing strings (e.g. "messageId contains unsafe
+ *    character"); surface them as 400.
+ *  - Everything else: a generic 500. We deliberately do NOT echo
+ *    `cause.message` back — internal exceptions leak absolute file
+ *    paths, JVM versions, and DTO class names. The full exception is
+ *    logged server-side so a developer can still diagnose. See
+ *    docs/SECURITY.md D11.
+ *
+ * `internal` so the desktopTest covers the same function rather than
+ * mirroring its logic (which would silently drift).
+ */
+internal fun Application.installPeerStatusPages() {
+    install(StatusPages) {
+        exception<BadRequestException> { call, cause ->
+            call.respond(
+                HttpStatusCode.BadRequest,
+                ErrorDto(error = ErrorCodes.BAD_REQUEST, detail = cause.message),
+            )
+        }
+        exception<IllegalArgumentException> { call, cause ->
+            call.respond(
+                HttpStatusCode.BadRequest,
+                ErrorDto(error = ErrorCodes.BAD_REQUEST, detail = cause.message),
+            )
+        }
+        exception<Throwable> { call, cause ->
+            Log.w(SERVER_TAG, "Unhandled exception in route ${call.request.path()}", cause)
+            call.respond(
+                HttpStatusCode.InternalServerError,
+                ErrorDto(error = ErrorCodes.INTERNAL_ERROR, detail = "internal error"),
+            )
+        }
+    }
+}
+
+/**
+ * Reject body-bearing requests larger than [maxBytes] up front. Requires
+ * `Content-Length` on POST/PUT/PATCH/DELETE so a peer can't bypass via
+ * chunked transfer; legitimate Ktor clients always include it for
+ * `setBody(json)`. Cf. docs/SECURITY.md D1.
+ *
+ * `internal` so the desktopTest covers the same function rather than
+ * mirroring its logic (which would silently drift).
+ */
+internal fun Application.installRequestSizeCap(maxBytes: Long) {
+    intercept(ApplicationCallPipeline.Plugins) {
+        val method = call.request.httpMethod
+        val expectsBody =
+            method != HttpMethod.Get &&
+                method != HttpMethod.Head &&
+                method != HttpMethod.Options
+        if (!expectsBody) return@intercept
+        val length = call.request.contentLength()
+        if (length == null) {
+            call.respond(
+                HttpStatusCode.LengthRequired,
+                ErrorDto(error = ErrorCodes.BAD_REQUEST, detail = "Content-Length required"),
+            )
+            return@intercept finish()
+        }
+        if (length > maxBytes) {
+            call.respond(
+                HttpStatusCode.PayloadTooLarge,
+                ErrorDto(
+                    error = ErrorCodes.BAD_REQUEST,
+                    detail = "Request body exceeds $maxBytes bytes",
+                ),
+            )
+            return@intercept finish()
+        }
     }
 }

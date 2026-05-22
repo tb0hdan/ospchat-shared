@@ -6,6 +6,7 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -72,5 +73,63 @@ class FileAvatarStoreTest {
         assertTrue(store.peerExists("u1", "new"))
         // u2's "old" untouched because cleanup is scoped per-uuid.
         assertTrue(store.peerExists("u2", "old"))
+    }
+
+    @Test
+    fun acceptsUuidAndHexHash() {
+        // Real wire inputs: UUID-shaped uuid, 64-char lowercase hex SHA-256.
+        val uuid = "123e4567-e89b-12d3-a456-426614174000"
+        val hash = "e".repeat(64)
+        store.writePeer(uuid = uuid, hash = hash, bytes = byteArrayOf(9))
+        assertTrue(store.peerExists(uuid, hash))
+    }
+
+    @Test
+    fun rejectsPeerPathTraversal() {
+        // Either field controlled by the peer (uuid via mDNS TXT, hash via
+        // /v1/info) must not be able to escape the avatar root.
+        assertFailsWith<IllegalArgumentException> {
+            store.writePeer(uuid = "../escape", hash = "h", bytes = byteArrayOf(1))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            store.writePeer(uuid = "u", hash = "../escape", bytes = byteArrayOf(1))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            store.writePeer(uuid = "u/v", hash = "h", bytes = byteArrayOf(1))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            store.peerExists("../u", "h")
+        }
+    }
+
+    @Test
+    fun rejectsSelfPathTraversal() {
+        assertFailsWith<IllegalArgumentException> {
+            store.writeSelf(byteArrayOf(1), hash = "../escape")
+        }
+        assertFailsWith<IllegalArgumentException> { store.selfExists("../escape") }
+        assertFailsWith<IllegalArgumentException> { store.readSelf("../escape") }
+    }
+
+    @Test
+    fun rejectsEmptyAndControlChars() {
+        assertFailsWith<IllegalArgumentException> {
+            store.writePeer(uuid = "", hash = "h", bytes = byteArrayOf(1))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            store.writePeer(uuid = "u", hash = "", bytes = byteArrayOf(1))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            store.writePeer(uuid = "u\n", hash = "h", bytes = byteArrayOf(1))
+        }
+    }
+
+    @Test
+    fun cleanupPeerRejectsUnsafeUuid() {
+        // Otherwise an attacker who got their malformed uuid into the upstream
+        // sync could trigger us to listFiles() with an attacker-controlled prefix.
+        assertFailsWith<IllegalArgumentException> {
+            store.cleanupPeerExcept(uuid = "../u", keepHash = "h")
+        }
     }
 }

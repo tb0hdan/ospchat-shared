@@ -1,5 +1,6 @@
 package com.ospchat.shared.data.peers
 
+import com.ospchat.shared.data.attachments.ImageBounds
 import com.ospchat.shared.data.avatar.AvatarStore
 import com.ospchat.shared.data.discovery.Peer
 import com.ospchat.shared.net.client.MessageClient
@@ -26,6 +27,7 @@ class PeerAvatarSync(
     private val client: MessageClient,
     private val peerDao: PeerDao,
     private val avatarStore: AvatarStore,
+    private val avatarBounds: ImageBounds,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -63,6 +65,9 @@ class PeerAvatarSync(
         val savedPath =
             withRetry(label = "/v1/avatar", peerUuid = peer.uuid) {
                 val bytes = client.fetchAvatar(peer, rediscover = false)
+                // Reject decompression bombs and undecodable bytes before
+                // they hit disk and Coil/Skia. See docs/SECURITY.md F4 / D6.
+                avatarBounds.assertOk(bytes, ImageBounds.AVATAR_MAX_EDGE)
                 avatarStore.writePeer(uuid = peer.uuid, hash = newHash, bytes = bytes)
             } ?: return
 

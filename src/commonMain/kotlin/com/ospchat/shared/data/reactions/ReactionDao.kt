@@ -38,16 +38,25 @@ interface ReactionDao {
     )
     fun observeForGroup(groupId: String): Flow<List<ReactionEntity>>
 
-    /** Snapshot variant of [observeForGroup] for one-shot reads (catch-up sync). */
+    /**
+     * Most-recent [limit] reactions on messages in [groupId]. One-shot read
+     * for catch-up sync. ORDER BY DESC means the receiver gets newest
+     * first; the receiver upserts so order doesn't affect the resulting
+     * state. See docs/SECURITY.md D5.
+     */
     @Query(
         """
         SELECT r.* FROM reactions r
         INNER JOIN group_messages gm ON gm.id = r.message_id
         WHERE gm.group_id = :groupId
-        ORDER BY r.reacted_at ASC
+        ORDER BY r.reacted_at DESC
+        LIMIT :limit
         """,
     )
-    suspend fun snapshotForGroup(groupId: String): List<ReactionEntity>
+    suspend fun snapshotForGroup(
+        groupId: String,
+        limit: Int,
+    ): List<ReactionEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(entity: ReactionEntity)

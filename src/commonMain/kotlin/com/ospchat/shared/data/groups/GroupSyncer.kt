@@ -100,7 +100,7 @@ class GroupSyncer(
                 val snapshot = groupRepository.snapshotOf(group.id) ?: return@mapNotNull null
                 val missing =
                     groupMessageDao
-                        .messagesAfter(group.id, cursor.latestSentAt)
+                        .messagesAfter(group.id, cursor.latestSentAt, MAX_MESSAGES_PER_GROUP)
                         .map {
                             GroupMessageDto(
                                 id = it.id,
@@ -113,10 +113,13 @@ class GroupSyncer(
                 // Include current reactions for the whole group, not only the
                 // missing slice — a reaction can land on an old message after
                 // the message itself synced, and there's no per-reaction cursor
-                // yet. Idempotent upsert on the receiver makes this safe.
+                // yet. Idempotent upsert on the receiver makes this safe. The
+                // most-recent MAX_REACTIONS_PER_GROUP win when the group has
+                // more — beyond-cap reactions don't propagate, which is an
+                // acceptable trade-off vs. OOM (docs/SECURITY.md D5).
                 val reactions =
                     reactionRepository
-                        ?.reactionsSnapshotForGroup(group.id)
+                        ?.reactionsSnapshotForGroup(group.id, MAX_REACTIONS_PER_GROUP)
                         ?.map { r ->
                             ReactionDto(
                                 messageId = r.messageId,
@@ -134,5 +137,22 @@ class GroupSyncer(
 
     private companion object {
         const val TAG = "GroupSyncer"
+
+        /**
+         * Per-group cap on the messages returned in one sync response. The
+         * receiver advances its cursor to the max sent_at it sees, so the
+         * next sync naturally picks up the next batch. See
+         * docs/SECURITY.md D5.
+         */
+        const val MAX_MESSAGES_PER_GROUP = 200
+
+        /**
+         * Per-group cap on the reactions returned in one sync response.
+         * Reactions are end-state per (message_id, from_uuid); over-cap
+         * reactions stop propagating, which is an acceptable trade-off
+         * vs. OOM on a group with tens of thousands of reactions. See
+         * docs/SECURITY.md D5.
+         */
+        const val MAX_REACTIONS_PER_GROUP = 1000
     }
 }

@@ -3,6 +3,7 @@ package com.ospchat.shared.data.db
 import androidx.room.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.ospchat.shared.data.groups.GroupEntity
+import com.ospchat.shared.data.groups.GroupMessageEntity
 import com.ospchat.shared.data.messages.MessageEntity
 import com.ospchat.shared.data.peers.PeerAddressEntity
 import com.ospchat.shared.data.peers.PeerEntity
@@ -349,4 +350,94 @@ class OspChatDatabaseTest {
         assertEquals(9, OSPCHAT_MIGRATIONS.size)
         assertTrue(OSPCHAT_MIGRATIONS.all { it.startVersion + 1 == it.endVersion })
     }
+
+    /**
+     * Covers the LIMIT clause added to `messagesAfter` for D5. Insert 50
+     * messages newer than the cursor; verify the cap returns the oldest N
+     * in ascending order — the pagination shape the sync responder relies
+     * on.
+     */
+    @Test
+    fun messagesAfterRespectsLimit() =
+        runTest {
+            db.groupDao().upsert(
+                GroupEntity(
+                    id = "gms",
+                    name = "G",
+                    kind = "CHAT",
+                    creatorUuid = "u1",
+                    createdAt = 0,
+                    membershipUpdatedAt = 0,
+                ),
+            )
+            (1..50).forEach { i ->
+                db.groupMessageDao().insert(
+                    GroupMessageEntity(
+                        id = "m$i",
+                        groupId = "gms",
+                        fromUuid = "u1",
+                        fromNickname = "U",
+                        body = "b$i",
+                        sentAt = i.toLong(),
+                        direction = "IN",
+                        status = "DELIVERED",
+                    ),
+                )
+            }
+            val first10 = db.groupMessageDao().messagesAfter("gms", after = 0, limit = 10)
+            assertEquals(10, first10.size)
+            assertEquals(1L, first10.first().sentAt)
+            assertEquals(10L, first10.last().sentAt)
+            // Caller advances cursor → next batch.
+            val next10 = db.groupMessageDao().messagesAfter("gms", after = 10, limit = 10)
+            assertEquals(11L, next10.first().sentAt)
+        }
+
+    /**
+     * Covers the LIMIT + ORDER BY DESC added to `snapshotForGroup` for D5.
+     * Most-recent N reactions win when the table holds more than the cap.
+     */
+    @Test
+    fun reactionsSnapshotRespectsLimitAndPicksMostRecent() =
+        runTest {
+            db.groupDao().upsert(
+                GroupEntity(
+                    id = "grx",
+                    name = "G",
+                    kind = "CHAT",
+                    creatorUuid = "u1",
+                    createdAt = 0,
+                    membershipUpdatedAt = 0,
+                ),
+            )
+            (1..5).forEach { i ->
+                db.groupMessageDao().insert(
+                    GroupMessageEntity(
+                        id = "gm$i",
+                        groupId = "grx",
+                        fromUuid = "u1",
+                        fromNickname = "U",
+                        body = "b",
+                        sentAt = i.toLong(),
+                        direction = "IN",
+                        status = "DELIVERED",
+                    ),
+                )
+                db.reactionDao().upsert(
+                    ReactionEntity(
+                        messageId = "gm$i",
+                        fromUuid = "u$i",
+                        fromNickname = "U$i",
+                        emoji = "👍",
+                        reactedAt = i.toLong() * 10,
+                    ),
+                )
+            }
+            val top3 = db.reactionDao().snapshotForGroup("grx", limit = 3)
+            assertEquals(3, top3.size)
+            // ORDER BY reacted_at DESC → newest reactedAt first.
+            assertEquals(50L, top3[0].reactedAt)
+            assertEquals(40L, top3[1].reactedAt)
+            assertEquals(30L, top3[2].reactedAt)
+        }
 }

@@ -1,6 +1,7 @@
 package com.ospchat.shared.data.messages
 
 import com.ospchat.shared.data.attachments.AttachmentStore
+import com.ospchat.shared.data.attachments.ImageBounds
 import com.ospchat.shared.data.attachments.ImageCompressor
 import com.ospchat.shared.data.discovery.Peer
 import com.ospchat.shared.data.identity.IdentityRepository
@@ -31,6 +32,7 @@ class MessageRepository(
     private val notifier: MessageNotifier,
     private val attachmentStore: AttachmentStore,
     private val attachmentCompressor: ImageCompressor,
+    private val attachmentBounds: ImageBounds,
 ) {
     // Long-lived scope for fire-and-forget attachment downloads.
     private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -156,6 +158,9 @@ class MessageRepository(
             // Background download — own retry semantics; don't mutate the
             // discovery snapshot on failure (see MessageClient.rediscover docs).
             val bytes = client.fetchAttachment(fromPeer, messageId, rediscover = false)
+            // Reject decompression bombs and undecodable bytes before they
+            // hit disk and Coil/Skia. See docs/SECURITY.md F4 / D6.
+            attachmentBounds.assertOk(bytes, ImageBounds.ATTACHMENT_MAX_EDGE)
             val path = attachmentStore.writeBytes(messageId, bytes)
             messageDao.updateAttachmentLocalPath(id = messageId, localPath = path)
         }.onFailure { Log.w(TAG, "Attachment download failed for $messageId", it) }

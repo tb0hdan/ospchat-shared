@@ -63,6 +63,8 @@ kotlin {
         val desktopTest by getting {
             dependencies {
                 implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:${libs.versions.kotlinxCoroutines.get()}")
+                implementation(libs.ktor.server.test.host)
+                implementation(libs.ktor.client.mock)
             }
         }
         val desktopMain by getting {

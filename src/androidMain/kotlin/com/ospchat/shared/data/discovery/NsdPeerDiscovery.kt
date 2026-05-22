@@ -238,7 +238,6 @@ class NsdPeerDiscovery(
         if (uuid.isNullOrBlank() || uuid == selfUuid) return
         val host = serviceInfo.host?.hostAddress ?: return
 
-        nameToUuid[serviceInfo.serviceName] = uuid
         val peer =
             Peer(
                 uuid = uuid,
@@ -246,7 +245,23 @@ class NsdPeerDiscovery(
                 host = host,
                 port = serviceInfo.port,
             )
-        _peers.update { it + (uuid to peer) }
+        when (val result = _peers.protectedInsert(uuid, peer)) {
+            PeerInsertResult.ACCEPTED -> {
+                nameToUuid[serviceInfo.serviceName] = uuid
+            }
+
+            PeerInsertResult.DROPPED_AT_CAP -> {
+                Log.w(TAG, "peer cap reached ($MAX_PEERS); dropping name=${serviceInfo.serviceName}")
+            }
+
+            PeerInsertResult.DROPPED_HIJACK -> {
+                Log.w(
+                    TAG,
+                    "hijack guard: refusing to overwrite uuid=$uuid (existing host) " +
+                        "with name=${serviceInfo.serviceName}@$host — ignoring; result=$result",
+                )
+            }
+        }
     }
 
     private companion object {

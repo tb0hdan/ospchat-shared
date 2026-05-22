@@ -21,10 +21,12 @@ import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
-import io.ktor.client.statement.readBytes
+import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.ContentType
+import io.ktor.http.contentLength
 import io.ktor.http.contentType
 import io.ktor.http.isSuccess
+import io.ktor.utils.io.core.readBytes
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -178,7 +180,7 @@ class MessageClient(
         peer: Peer,
         messageId: String,
         rediscover: Boolean = true,
-    ): ByteArray = bytesFromPeer(peer, "/v1/attachments/$messageId", rediscover)
+    ): ByteArray = bytesFromPeer(peer, "/v1/attachments/$messageId", ATTACHMENT_MAX_BYTES, rediscover)
 
     suspend fun getInfo(
         peer: Peer,
@@ -204,11 +206,12 @@ class MessageClient(
     suspend fun fetchAvatar(
         peer: Peer,
         rediscover: Boolean = true,
-    ): ByteArray = bytesFromPeer(peer, "/v1/avatar", rediscover)
+    ): ByteArray = bytesFromPeer(peer, "/v1/avatar", AVATAR_MAX_BYTES, rediscover)
 
     private suspend fun bytesFromPeer(
         peer: Peer,
         path: String,
+        maxBytes: Long,
         rediscover: Boolean,
     ): ByteArray {
         var effective = peer
@@ -219,12 +222,36 @@ class MessageClient(
                 if (!response.status.isSuccess()) {
                     error("Peer rejected $path: HTTP ${response.status.value}")
                 }
-                return response.readBytes()
+                return response.readBoundedBytes(maxBytes, path)
             } catch (t: Throwable) {
                 effective = rediscoverOrThrow(peer, effective, retried, t, rediscover)
                 retried = true
             }
         }
+    }
+
+    /**
+     * Read the response body with a hard byte cap. Checks the declared
+     * `Content-Length` first (fails fast on a malicious server announcing a
+     * huge body) and then bounds the actual read via
+     * `bodyAsChannel().readRemaining(maxBytes + 1)`. The `+1` lets us tell
+     * a body that hit the cap exactly from one that overran it. Cf.
+     * docs/SECURITY.md D2.
+     */
+    private suspend fun HttpResponse.readBoundedBytes(
+        maxBytes: Long,
+        path: String,
+    ): ByteArray {
+        val declared = contentLength()
+        if (declared != null && declared > maxBytes) {
+            error("Peer $path response declares $declared bytes (cap $maxBytes)")
+        }
+        val packet = bodyAsChannel().readRemaining(maxBytes + 1L)
+        val bytes = packet.readBytes()
+        if (bytes.size.toLong() > maxBytes) {
+            error("Peer $path response exceeded cap $maxBytes bytes")
+        }
+        return bytes
     }
 
     private suspend inline fun <reified T> postJson(
@@ -337,5 +364,21 @@ class MessageClient(
          * the UI noticeably.
          */
         const val REDISCOVER_TIMEOUT_MS = 3_000L
+
+        /**
+         * Hard cap on a single `/v1/attachments/{id}` response body. The
+         * compressor caps outgoing JPEGs at 1920 px / ~1 MB (see
+         * [com.ospchat.shared.data.attachments.ImageCompressor]) — 16 MB
+         * leaves slack for slightly larger legitimate images while still
+         * blocking the gigabyte-OOM attack. Cf. docs/SECURITY.md D2.
+         */
+        const val ATTACHMENT_MAX_BYTES = 16L * 1024 * 1024
+
+        /**
+         * Hard cap on a `/v1/avatar` response body. Avatars are compressed
+         * to 256 px on the longest edge; 2 MB is generous for any reasonable
+         * JPEG at that resolution. Cf. docs/SECURITY.md D2.
+         */
+        const val AVATAR_MAX_BYTES = 2L * 1024 * 1024
     }
 }

@@ -14,10 +14,20 @@ interface GroupMessageDao {
     @Query("SELECT MAX(sent_at) FROM group_messages WHERE group_id = :groupId")
     suspend fun latestSentAt(groupId: String): Long?
 
-    @Query("SELECT * FROM group_messages WHERE group_id = :groupId AND sent_at > :after ORDER BY sent_at ASC")
+    /**
+     * Oldest [limit] messages strictly newer than [after]. ORDER BY ASC +
+     * LIMIT is the natural pagination shape for cursor-forward sync: the
+     * receiver advances its cursor to the max sent_at it sees and the next
+     * sync picks up the next batch. See docs/SECURITY.md D5.
+     */
+    @Query(
+        "SELECT * FROM group_messages WHERE group_id = :groupId AND sent_at > :after " +
+            "ORDER BY sent_at ASC LIMIT :limit",
+    )
     suspend fun messagesAfter(
         groupId: String,
         after: Long,
+        limit: Int,
     ): List<GroupMessageEntity>
 
     @Query("SELECT * FROM group_messages WHERE id = :id")
