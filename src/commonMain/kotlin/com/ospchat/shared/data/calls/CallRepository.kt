@@ -82,6 +82,22 @@ class CallRepository(
     private val notifier: CallNotifier,
     private val peerDao: PeerDao? = null,
     private val ringTimeoutMs: Long = DEFAULT_RING_TIMEOUT_MS,
+    /**
+     * Phase 3 multi-network bridging — when non-null, [startCall] and
+     * [acceptCall] consult the registry for a TURN-capable bridge peer.
+     * Null leaves the call host-candidates-only (pre-phase-3 behaviour).
+     */
+    private val relayBridgeRegistry: com.ospchat.shared.data.peers.RelayBridgeRegistry? = null,
+    /**
+     * Phase 5 multi-network bridging — when non-null, outbound call
+     * signaling DTOs (`offer` / `answer` / `ice` / `hangup`) consult the
+     * router for a direct-or-bridged next-hop. Targets in the live
+     * discovery snapshot send directly (route.toUuid==null); gossip-only
+     * targets POST to a relay-enabled bridge with `toUuid` set to the
+     * final target's UUID. Null falls back to the pre-PR-3 direct send
+     * (existing behaviour for callers that haven't wired phase-4 yet).
+     */
+    private val peerRouter: com.ospchat.shared.data.peers.PeerRouter? = null,
 ) {
     /** Live row for the call that isn't yet `ENDED`, or `null` when idle. */
     val activeCall: Flow<Call?> = dao.observeActive().map { it?.toDomain() }
@@ -127,6 +143,30 @@ class CallRepository(
         val startedAt = Clock.System.now().toEpochMilliseconds()
         Log.d(TAG, "startCall callId=$callId peer=${peer.uuid}@${peer.host}:${peer.port}")
 
+        // Phase 5 multi-network bridging — resolve a route to the target
+        // peer BEFORE creating the session. If the target is only reachable
+        // via a bridge (gossip-only, no direct discovery), the offer DTO's
+        // `toUuid` is set so the bridge knows to forward; the wire POST
+        // goes to the bridge as the immediate next hop. Pre-PR-3 fallback
+        // (no peerRouter wired, or no route found): direct POST to [peer]
+        // as before — same behaviour as today for LAN-only calls.
+        val route = routeFor(peer.uuid, fallbackPeer = peer)
+        val nextHop = route.first
+        val toUuid = route.second
+        Log.d(
+            TAG,
+            "startCall route callId=$callId target=${peer.uuid} nextHop=${nextHop.uuid}@${nextHop.host}:${nextHop.port} " +
+                "toUuid=$toUuid",
+        )
+
+        // Phase 3 multi-network bridging — speculatively fetch TURN
+        // credentials from a relay-capable bridge before we create the
+        // session. ICE always prefers host pairs, so the TURN candidates
+        // are only used if direct doesn't connect. Failure here is
+        // non-fatal: empty list → host-only call (existing behaviour).
+        // Done outside the mutex so a slow bridge can't block hangup.
+        val iceServers = fetchRelayIceServers(selfUuid)
+
         // Hold the mutex only for in-memory + DB state mutation; HTTP sends
         // are dispatched outside the lock so they can't block the call
         // state machine (ICE, hangup, mute) for the duration of the round
@@ -134,7 +174,7 @@ class CallRepository(
         val offerDto: CallOfferDto =
             mutex.withLock {
                 check(current == null) { "another call is already active" }
-                val session = sessionFactory.create()
+                val session = sessionFactory.create(iceServers)
                 val sdp = session.createOffer()
                 Log.d(TAG, "createOffer ok callId=$callId sdpLen=${sdp.length}")
                 val call =
@@ -147,7 +187,15 @@ class CallRepository(
                         startedAt = startedAt,
                     )
                 dao.upsert(call.toEntity())
-                current = bindSession(callId = callId, peer = peer, session = session, selfUuid = selfUuid)
+                current =
+                    bindSession(
+                        callId = callId,
+                        peer = nextHop,
+                        remoteUuid = peer.uuid,
+                        toUuid = toUuid,
+                        session = session,
+                        selfUuid = selfUuid,
+                    )
                 // Schedule the no-answer timeout. The launcher is cancelled when
                 // the call leaves RINGING (acceptance or hangup).
                 current?.ringTimeoutJob = scheduleRingTimeout(callId)
@@ -157,10 +205,11 @@ class CallRepository(
                     fromNickname = selfNickname,
                     sdp = sdp,
                     sentAt = startedAt,
+                    toUuid = toUuid,
                 )
             }
-        Log.d(TAG, "POST /v1/call/offer → ${peer.uuid}@${peer.host}:${peer.port} callId=$callId")
-        runCatching { client.sendCallOffer(peer, offerDto) }
+        Log.d(TAG, "POST /v1/call/offer → ${nextHop.uuid}@${nextHop.host}:${nextHop.port} callId=$callId toUuid=$toUuid")
+        runCatching { client.sendCallOffer(nextHop, offerDto) }
             .onFailure {
                 Log.w(TAG, "sendCallOffer failed callId=$callId", it)
                 mutex.withLock { tearDown(callId, Call.EndReason.FAILED) }
@@ -177,8 +226,14 @@ class CallRepository(
         val selfUuid = identityRepository.ensureUuid()
         Log.d(TAG, "acceptCall callId=$callId")
 
+        // Phase 3 — same speculative TURN prefetch as startCall. Done
+        // outside the mutex so the relay-cred HTTP round trip doesn't
+        // delay the accepted ringer cancel.
+        val iceServers = fetchRelayIceServers(selfUuid)
+
         data class Accepted(
-            val peer: Peer,
+            val nextHop: Peer,
+            val toUuid: String?,
             val answerSdp: String,
         )
         val accepted: Accepted? =
@@ -190,7 +245,7 @@ class CallRepository(
                     }
                 pending.timeoutJob?.cancel()
                 check(current == null) { "another call is already active" }
-                val session = sessionFactory.create()
+                val session = sessionFactory.create(iceServers)
                 val answerSdp = session.acceptOffer(pending.remoteSdp)
                 Log.d(
                     TAG,
@@ -213,19 +268,43 @@ class CallRepository(
                 val row = dao.findById(callId) ?: return@withLock null
                 val updated = row.toDomain().copy(state = Call.State.CONNECTING).toEntity()
                 dao.upsert(updated)
-                current = bindSession(callId = callId, peer = pending.peer, session = session, selfUuid = selfUuid)
+                // Phase 5 — resolve a route to the original caller so the
+                // answer + subsequent ICE replies follow the same bridge
+                // path the offer arrived on (or go direct when the caller
+                // is in our discovery snapshot).
+                val (replyNextHop, replyToUuid) = routeFor(pending.originatorUuid, pending.peer)
+                Log.d(
+                    TAG,
+                    "acceptCall route callId=$callId originator=${pending.originatorUuid} " +
+                        "nextHop=${replyNextHop.uuid}@${replyNextHop.host}:${replyNextHop.port} toUuid=$replyToUuid",
+                )
+                current =
+                    bindSession(
+                        callId = callId,
+                        peer = replyNextHop,
+                        remoteUuid = pending.originatorUuid,
+                        toUuid = replyToUuid,
+                        session = session,
+                        selfUuid = selfUuid,
+                    )
                 notifier.cancel(callId)
-                Accepted(pending.peer, answerSdp)
+                Accepted(replyNextHop, replyToUuid, answerSdp)
             }
         if (accepted != null) {
             Log.d(
                 TAG,
-                "POST /v1/call/answer → ${accepted.peer.uuid}@${accepted.peer.host}:${accepted.peer.port} callId=$callId",
+                "POST /v1/call/answer → ${accepted.nextHop.uuid}@${accepted.nextHop.host}:${accepted.nextHop.port} " +
+                    "callId=$callId toUuid=${accepted.toUuid}",
             )
             runCatching {
                 client.sendCallAnswer(
-                    accepted.peer,
-                    CallAnswerDto(callId = callId, fromUuid = selfUuid, sdp = accepted.answerSdp),
+                    accepted.nextHop,
+                    CallAnswerDto(
+                        callId = callId,
+                        fromUuid = selfUuid,
+                        sdp = accepted.answerSdp,
+                        toUuid = accepted.toUuid,
+                    ),
                 )
             }.onFailure {
                 Log.w(TAG, "sendCallAnswer failed callId=$callId", it)
@@ -245,19 +324,49 @@ class CallRepository(
     ) {
         val selfUuid = identityRepository.ensureUuid()
         Log.d(TAG, "hangUp callId=$callId reason=$reason")
-        val peer: Peer?
+        // Phase 5 — capture the immediate next-hop AND the wire-level toUuid
+        // BEFORE tearDown clears `current`. Prefers the stored ActiveCall
+        // routing info (the bridged path the call has been using); falls
+        // back to PendingOffer for hangups during RINGING (immediate
+        // sender = next-hop, toUuid = originatorUuid when relayed).
+        val nextHop: Peer?
+        val toUuid: String?
         mutex.withLock {
+            val active = current
             val pending = pendingOffers[callId]
-            peer = pending?.peer ?: current?.peer ?: resolvePeer(callId)
+            when {
+                active != null && active.callId == callId -> {
+                    nextHop = active.peer
+                    toUuid = active.toUuid
+                }
+
+                pending != null -> {
+                    // The PendingOffer's sender is the immediate previous hop.
+                    // If it was a bridged offer, sender.uuid != originatorUuid;
+                    // the bridge will forward our hangup if we set toUuid.
+                    val route = routeFor(pending.originatorUuid, pending.peer)
+                    nextHop = route.first
+                    toUuid = route.second
+                }
+
+                else -> {
+                    nextHop = resolvePeer(callId)
+                    toUuid = null
+                }
+            }
             tearDown(callId, reason)
             notifier.cancel(callId)
         }
-        if (peer != null) {
-            Log.d(TAG, "POST /v1/call/hangup → ${peer.uuid}@${peer.host}:${peer.port} callId=$callId reason=$reason")
+        if (nextHop != null) {
+            Log.d(
+                TAG,
+                "POST /v1/call/hangup → ${nextHop.uuid}@${nextHop.host}:${nextHop.port} callId=$callId " +
+                    "reason=$reason toUuid=$toUuid",
+            )
             runCatching {
                 client.sendCallHangup(
-                    peer,
-                    CallHangupDto(callId = callId, fromUuid = selfUuid, reason = reason.name),
+                    nextHop,
+                    CallHangupDto(callId = callId, fromUuid = selfUuid, reason = reason.name, toUuid = toUuid),
                 )
             }.onFailure { Log.w(TAG, "sendCallHangup failed callId=$callId", it) }
         } else {
@@ -312,14 +421,22 @@ class CallRepository(
                 val call =
                     Call(
                         id = dto.callId,
-                        peerUuid = sender.uuid,
+                        // peerUuid is the conversation key in the UI — always
+                        // the originator (dto.fromUuid), not the immediate
+                        // sender which may be a bridge for relayed calls.
+                        peerUuid = dto.fromUuid,
                         peerNickname = dto.fromNickname,
                         direction = Call.Direction.INCOMING,
                         state = Call.State.RINGING,
                         startedAt = dto.sentAt,
                     )
                 dao.upsert(call.toEntity())
-                val pending = PendingOffer(peer = sender, remoteSdp = dto.sdp)
+                val pending =
+                    PendingOffer(
+                        peer = sender,
+                        originatorUuid = dto.fromUuid,
+                        remoteSdp = dto.sdp,
+                    )
                 // Drain pre-offer ICE candidates (POSTed by the caller before
                 // its offer POST landed on us — see [preOfferIce]). Sender
                 // must match the offer's sender; otherwise discard as
@@ -351,14 +468,17 @@ class CallRepository(
         if (busy) {
             // Best-effort busy-hangup back to the caller, outside the mutex so
             // we don't block the call state machine for the duration of the
-            // round-trip.
+            // round-trip. Routes through the same bridge the offer arrived
+            // on if dto.toUuid was set (bridged offer); otherwise direct.
+            val (replyHop, replyToUuid) = routeFor(dto.fromUuid, sender)
             runCatching {
                 client.sendCallHangup(
-                    sender,
+                    replyHop,
                     CallHangupDto(
                         callId = dto.callId,
                         fromUuid = selfUuid,
                         reason = Call.EndReason.BUSY.name,
+                        toUuid = replyToUuid,
                     ),
                 )
             }.onFailure { Log.w(TAG, "busy-hangup back failed callId=${dto.callId}", it) }
@@ -391,10 +511,14 @@ class CallRepository(
                 )
                 return
             }
-            if (active.peer.uuid != sender.uuid) {
+            // Compare against the remote party's UUID — for bridged calls
+            // active.peer is the bridge (= immediate next-hop), not the
+            // originator. The DTO's signed fromUuid (= sender.uuid after
+            // verifiedPeerOrRespond) is the originator regardless of hops.
+            if (active.remoteUuid != sender.uuid) {
                 Log.w(
                     TAG,
-                    "applyAnswer: sender mismatch dto=${sender.uuid} active=${active.peer.uuid} — dropping",
+                    "applyAnswer: sender mismatch dto=${sender.uuid} active=${active.remoteUuid} — dropping",
                 )
                 return
             }
@@ -437,10 +561,13 @@ class CallRepository(
                     )
                     return
                 }
-                if (active.peer.uuid != sender.uuid) {
+                // Same correction as [applyAnswer] — for bridged calls
+                // active.peer is the bridge; compare against the remote
+                // party's UUID instead.
+                if (active.remoteUuid != sender.uuid) {
                     Log.w(
                         TAG,
-                        "applyIce: sender mismatch dto=${sender.uuid} active=${active.peer.uuid} — dropping",
+                        "applyIce: sender mismatch dto=${sender.uuid} active=${active.remoteUuid} — dropping",
                     )
                     return
                 }
@@ -505,11 +632,16 @@ class CallRepository(
                 )
                 return
             }
-            if (pending.peer.uuid != sender.uuid) {
+            // Compare against the originator UUID stored on the PendingOffer
+            // — for bridged offers `pending.peer` is the bridge (immediate
+            // sender), not the originator. Pre-offer ICE for a relayed call
+            // arrives from the same originator (the bridge resolves
+            // verifiedPeerOrRespond against gossip).
+            if (pending.originatorUuid != sender.uuid) {
                 Log.w(
                     TAG,
                     "applyIce: pending-offer sender mismatch dto=${sender.uuid} " +
-                        "pending=${pending.peer.uuid} — dropping",
+                        "originator=${pending.originatorUuid} — dropping",
                 )
                 return
             }
@@ -539,20 +671,20 @@ class CallRepository(
                 dto.reason?.let { runCatching { Call.EndReason.valueOf(it) }.getOrNull() }
                     ?: Call.EndReason.HANGUP
             val pending = pendingOffers[dto.callId]
-            if (pending != null && pending.peer.uuid != sender.uuid) {
+            if (pending != null && pending.originatorUuid != sender.uuid) {
                 Log.w(
                     TAG,
                     "applyHangup: pending-offer sender mismatch dto=${sender.uuid} " +
-                        "pending=${pending.peer.uuid} — ignoring",
+                        "originator=${pending.originatorUuid} — ignoring",
                 )
                 // Ignore stray hangups from unrelated peers on a pending offer.
                 return
             }
             val active = current
-            if (active != null && active.callId == dto.callId && active.peer.uuid != sender.uuid) {
+            if (active != null && active.callId == dto.callId && active.remoteUuid != sender.uuid) {
                 Log.w(
                     TAG,
-                    "applyHangup: active sender mismatch dto=${sender.uuid} active=${active.peer.uuid} — ignoring",
+                    "applyHangup: active sender mismatch dto=${sender.uuid} active=${active.remoteUuid} — ignoring",
                 )
                 return
             }
@@ -566,6 +698,8 @@ class CallRepository(
     private fun bindSession(
         callId: String,
         peer: Peer,
+        remoteUuid: String,
+        toUuid: String?,
         session: AudioCallSession,
         selfUuid: String,
     ): ActiveCall {
@@ -579,9 +713,11 @@ class CallRepository(
                     )
                     Log.d(
                         TAG,
-                        "POST /v1/call/ice → ${peer.uuid}@${peer.host}:${peer.port} callId=$callId",
+                        "POST /v1/call/ice → ${peer.uuid}@${peer.host}:${peer.port} callId=$callId " +
+                            "toUuid=$toUuid",
                     )
-                    runCatching { client.sendCallIce(peer, candidate.toDto(callId, selfUuid)) }
+                    val dto = candidate.toDto(callId, selfUuid).copy(toUuid = toUuid)
+                    runCatching { client.sendCallIce(peer, dto) }
                         .onSuccess { Log.d(TAG, "sendCallIce ok callId=$callId") }
                         .onFailure { Log.w(TAG, "sendCallIce failed callId=$callId", it) }
                 }
@@ -596,6 +732,8 @@ class CallRepository(
         return ActiveCall(
             callId = callId,
             peer = peer,
+            remoteUuid = remoteUuid,
+            toUuid = toUuid,
             session = session,
             iceForwarderJob = iceJob,
             stateObserverJob = stateJob,
@@ -692,8 +830,86 @@ class CallRepository(
             }
         }
 
+    /**
+     * Phase 5 multi-network bridging — resolve the wire-level next-hop +
+     * `toUuid` for an outbound signaling DTO targeting [targetUuid].
+     *
+     *   - When `peerRouter` is not wired: returns ([fallbackPeer], null).
+     *     Pre-PR-3 behaviour for callers that haven't wired phase 4.
+     *   - When the router returns a direct route (target in discovery):
+     *     ([direct peer], null).
+     *   - When the router returns a bridged route (target only in gossip):
+     *     ([bridge peer], targetUuid).
+     *   - When the router has no route at all (gossip unknown, or no
+     *     relay-enabled bridge vouches): returns ([fallbackPeer], null).
+     *     Callers tried via the immediate-hop fallback can still succeed
+     *     against the direct-discovery case the router missed during a
+     *     refresh race.
+     *
+     * Returns a Pair of (next-hop, toUuid).
+     */
+    private fun routeFor(
+        targetUuid: String,
+        fallbackPeer: Peer? = null,
+    ): Pair<Peer, String?> {
+        val router = peerRouter
+        if (router != null) {
+            val route = router.routeTo(targetUuid)
+            if (route != null) {
+                return route.nextHop to route.toUuid
+            }
+        }
+        // No router or no route — fall back to the supplied peer (an
+        // immediate-hop sender for inbound; the originally-passed target
+        // peer for outbound). Caller must guarantee a non-null fallback
+        // where applicable.
+        val fb = fallbackPeer ?: error("routeFor: no router route and no fallback peer for target=$targetUuid")
+        return fb to null
+    }
+
+    /**
+     * Phase 3 multi-network bridging — try to get a TURN credential from the
+     * first reachable relay-capable bridge. Returns an empty list when no
+     * bridge is known, when the request fails for any reason, or when no
+     * relay-cred registry is wired. Caller-side errors never abort the call;
+     * we just fall back to host-candidate-only ICE.
+     */
+    private suspend fun fetchRelayIceServers(selfUuid: String): List<com.ospchat.shared.turn.IceServerConfig> {
+        val registry = relayBridgeRegistry ?: return emptyList()
+        val bridgeUuid = registry.bridges.value.firstOrNull() ?: return emptyList()
+        val bridge =
+            discoveryRepository.peerSnapshot.value[bridgeUuid] ?: run {
+                Log.d(TAG, "fetchRelayIceServers: bridge $bridgeUuid not in discovery snapshot")
+                return emptyList()
+            }
+        val request =
+            com.ospchat.shared.net.dto.RelayCredRequestDto(
+                fromUuid = selfUuid,
+                requestedAt = Clock.System.now().toEpochMilliseconds(),
+            )
+        val response =
+            runCatching { client.getRelayCred(bridge, request) }
+                .onFailure { Log.w(TAG, "fetchRelayIceServers: getRelayCred failed", it) }
+                .getOrNull() ?: return emptyList()
+        Log.d(TAG, "fetchRelayIceServers: bridge=$bridgeUuid uris=${response.uris.size}")
+        return response.uris.map { uri ->
+            com.ospchat.shared.turn.IceServerConfig(
+                uri = uri,
+                username = response.username,
+                credential = response.credential,
+            )
+        }
+    }
+
     private data class PendingOffer(
+        // [peer] is the immediate previous hop on the wire — could be the
+        // originator (direct) or a bridge (relayed).
         val peer: Peer,
+        // [originatorUuid] is the call originator's UUID, taken from the
+        // signed offer DTO's `fromUuid`. Replies (answer / ice / hangup)
+        // route to this UUID via PeerRouter, so a bridged offer answers
+        // via the same bridge.
+        val originatorUuid: String,
         val remoteSdp: String,
         var timeoutJob: Job? = null,
         // ICE candidates that arrived before the user accepted. Drained into
@@ -710,7 +926,17 @@ class CallRepository(
 
     private data class ActiveCall(
         val callId: String,
+        // [peer] is the immediate next-hop on the wire — could be the
+        // remote party (direct) or a bridge (relayed).
         val peer: Peer,
+        // [remoteUuid] is the other party's UUID (the actual peer at the
+        // far end of the call, regardless of routing). Stored on
+        // [CallOfferDto.toUuid] / `CallAnswerDto.toUuid` / etc. when
+        // routed through a bridge.
+        val remoteUuid: String,
+        // [toUuid] is the value to put on outbound signaling DTOs for
+        // this call: null for direct, [remoteUuid] for bridged.
+        val toUuid: String?,
         val session: AudioCallSession,
         val iceForwarderJob: Job,
         val stateObserverJob: Job,

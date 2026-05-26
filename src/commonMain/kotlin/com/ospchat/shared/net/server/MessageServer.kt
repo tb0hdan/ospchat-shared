@@ -10,8 +10,11 @@ import com.ospchat.shared.data.groups.GroupSyncer
 import com.ospchat.shared.data.identity.IdentityRepository
 import com.ospchat.shared.data.messages.MessageDao
 import com.ospchat.shared.data.messages.MessageRepository
+import com.ospchat.shared.data.peers.GossipedPeerStore
 import com.ospchat.shared.data.peers.PeerAvatarSync
+import com.ospchat.shared.data.peers.PeerDao
 import com.ospchat.shared.data.reactions.ReactionRepository
+import com.ospchat.shared.net.client.MessageClient
 import com.ospchat.shared.net.dto.ErrorDto
 import com.ospchat.shared.util.Log
 import io.ktor.http.HttpMethod
@@ -64,6 +67,34 @@ class MessageServer(
     private val groupRepository: GroupRepository? = null,
     private val groupSyncer: GroupSyncer? = null,
     private val callRepository: CallRepository? = null,
+    /**
+     * Phase 4 multi-network bridging — forwarded to `installMessageRoutes`
+     * as the relay forwarder. When `null`, every relay request is refused
+     * with `relay_unroutable`. Consumers wire this with the same
+     * [MessageClient] they use for outbound peer calls.
+     */
+    private val messageClient: MessageClient? = null,
+    /**
+     * Phase 4 multi-network bridging — forwarded to `installMessageRoutes`
+     * as the signer-pubkey-lookup fallback. When `null`, relayed messages
+     * from peers we don't directly discover get `unknown_peer` 404.
+     */
+    private val gossipedPeerStore: GossipedPeerStore? = null,
+    /**
+     * Phase 4 multi-network bridging — when non-null, gossip responses
+     * advertise each gossiped peer's locally-cached `avatarHash` so
+     * phantom-peer consumers can detect updates, and the
+     * `/v1/peer-avatar/{uuid}` route serves the bytes by reading this
+     * DAO for the hash and the avatar store for the bytes.
+     */
+    private val peerDao: PeerDao? = null,
+    /**
+     * Phase 3 multi-network bridging — when non-null, the
+     * `POST /v1/call/relay-cred` route issues credentials from this
+     * service (typically `OspChatTurnServer`). When null, that route
+     * responds with 503 `relay_unavailable`.
+     */
+    private val turnCredentialService: com.ospchat.shared.turn.TurnCredentialService? = null,
 ) {
     @Volatile private var engine: ApplicationEngine? = null
 
@@ -84,11 +115,19 @@ class MessageServer(
         uuid: String,
         nickname: String,
         preferredPort: Int = 0,
+        publicKeyB64: String? = null,
+        relayEnabled: Boolean = false,
     ): Int {
         synchronized(lock) {
             if (engine != null) return boundPort
         }
-        val identity = ServerIdentity(uuid = uuid, nickname = nickname)
+        val identity =
+            ServerIdentity(
+                uuid = uuid,
+                nickname = nickname,
+                publicKeyB64 = publicKeyB64,
+                relayEnabled = relayEnabled,
+            )
 
         if (preferredPort in 1..65535) {
             tryBind(identity, preferredPort)?.let { return it }
@@ -128,6 +167,11 @@ class MessageServer(
                         groupSyncer = groupSyncer,
                         callRepository = callRepository,
                         avatarHashSupplier = { identityRepository.currentAvatarHash() },
+                        peerAvatarHashSupplier = { uuid -> peerDao?.findByUuid(uuid)?.avatarHash },
+                        messageClient = messageClient,
+                        gossipedPeerStore = gossipedPeerStore,
+                        turnCredentialService = turnCredentialService,
+                        signingKeyPairProvider = { identityRepository.signingKeyPairOrNull() },
                     )
                 }
             }

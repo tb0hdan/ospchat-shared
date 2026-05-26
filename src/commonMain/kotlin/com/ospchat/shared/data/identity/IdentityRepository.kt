@@ -2,9 +2,13 @@ package com.ospchat.shared.data.identity
 
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import com.ospchat.shared.crypto.SigningCrypto
+import com.ospchat.shared.crypto.SigningKeyPair
+import com.ospchat.shared.util.Base64Util
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -84,10 +88,106 @@ class IdentityRepository(
         store.edit { it[SERVER_PORT_KEY] = port }
     }
 
+    /**
+     * Phase 4 multi-network bridging — `true` when the local user has
+     * opted in to relaying signed DTOs for other peers. The flag is
+     * surfaced in `GET /v1/info.relayEnabled` and gates the relay-forward
+     * branch in `MessageRoutes`. Default `false`.
+     *
+     * Read at startup and passed to `MessageServer.start(relayEnabled=...)`
+     * — runtime toggles take effect on next restart in phase 4 MVP.
+     */
+    val relayEnabledFlow: Flow<Boolean> = store.data.map { it[RELAY_ENABLED_KEY] ?: false }
+
+    suspend fun currentRelayEnabled(): Boolean = store.data.first()[RELAY_ENABLED_KEY] ?: false
+
+    suspend fun setRelayEnabled(enabled: Boolean) {
+        store.edit { it[RELAY_ENABLED_KEY] = enabled }
+    }
+
+    /**
+     * In-memory cache of the loaded signing keypair. Populated on the
+     * first [ensureSigningKeyPair] call; exposed synchronously via
+     * [signingKeyPairOrNull] for non-suspend call sites (notably
+     * [MessageClient]'s `sign()` overloads, which need the key on every
+     * outbound DTO and can't be made suspend without cascading into the
+     * inline-reified `postJson` plumbing).
+     */
+    @Volatile private var cachedSigningKey: SigningKeyPair? = null
+
+    /**
+     * Returns this install's stable Ed25519 signing keypair, generating + persisting
+     * it on first use. The private seed is stored base64 in DataStore; the
+     * public half is derived on every load. Phase 2a multi-network bridging
+     * uses the public half as a cryptographic identity advertised over mDNS
+     * TXT (`pk=`) and `GET /v1/info`; phase 2b uses the keypair to sign
+     * outbound DTOs.
+     *
+     * Idempotent under concurrent first-time callers: the persisted seed
+     * wins under a re-check inside the DataStore edit, mirroring [ensureUuid].
+     * The result is cached for [signingKeyPairOrNull].
+     */
+    suspend fun ensureSigningKeyPair(): SigningKeyPair {
+        cachedSigningKey?.let { return it }
+        store.data.first()[SIGNING_SEED_KEY]?.let { encoded ->
+            runCatching { Base64Util.decode(encoded) }.getOrNull()?.let { seed ->
+                if (seed.size == SigningCrypto.privateSeedSize) {
+                    val restored = SigningCrypto.fromSeed(seed)
+                    cachedSigningKey = restored
+                    return restored
+                }
+            }
+            // Corrupt / wrong-size seed: fall through and regenerate.
+        }
+        val generated = SigningCrypto.generate()
+        val seedB64 = Base64Util.encode(generated.privateSeedBytes())
+        var winnerSeed = seedB64
+        store.edit { prefs ->
+            val existing = prefs[SIGNING_SEED_KEY]
+            if (existing != null) {
+                runCatching { Base64Util.decode(existing) }.getOrNull()?.let { seed ->
+                    if (seed.size == SigningCrypto.privateSeedSize) {
+                        winnerSeed = existing
+                        return@edit
+                    }
+                }
+                // existing was corrupt; overwrite
+            }
+            prefs[SIGNING_SEED_KEY] = seedB64
+        }
+        val result =
+            if (winnerSeed == seedB64) {
+                generated
+            } else {
+                SigningCrypto.fromSeed(Base64Util.decode(winnerSeed))
+            }
+        cachedSigningKey = result
+        return result
+    }
+
+    /**
+     * Phase 2b multi-network bridging — non-suspend accessor for the
+     * cached signing keypair. Returns null until [ensureSigningKeyPair]
+     * has run at least once. Consumers pass `{ identityRepository.signingKeyPairOrNull() }`
+     * into [MessageClient]'s `signingKeyProvider` so every outbound DTO
+     * carries a fresh signature once the keypair is loaded.
+     */
+    fun signingKeyPairOrNull(): SigningKeyPair? = cachedSigningKey
+
     private companion object {
         val NICKNAME_KEY = stringPreferencesKey("nickname")
         val UUID_KEY = stringPreferencesKey("uuid")
         val AVATAR_HASH_KEY = stringPreferencesKey("avatar_hash")
         val SERVER_PORT_KEY = intPreferencesKey("server_port")
+
+        /**
+         * Base64-encoded Ed25519 private seed (32 raw bytes → 44 b64 chars).
+         * Stored as a string preference because DataStore-Preferences has no
+         * `ByteArrayPreferencesKey` primitive in the multiplatform variant.
+         */
+        val SIGNING_SEED_KEY = stringPreferencesKey("signing_seed_b64")
+
+        /** Phase 4 — opt-in flag for relaying signed DTOs on behalf of other peers. */
+        val RELAY_ENABLED_KEY = booleanPreferencesKey("relay_enabled")
     }
 }

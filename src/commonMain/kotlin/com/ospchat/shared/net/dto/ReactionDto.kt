@@ -1,5 +1,7 @@
 package com.ospchat.shared.net.dto
 
+import com.ospchat.shared.crypto.SignatureDomain
+import com.ospchat.shared.crypto.SignaturePayloadBuilder
 import kotlinx.serialization.Serializable
 
 /**
@@ -12,6 +14,10 @@ import kotlinx.serialization.Serializable
  * use it to validate the sender against group membership instead of the
  * DM "peer is the message's peer" rule. Defaults to `null` for wire
  * compatibility with peers that predate group reactions.
+ *
+ * Phase 2b multi-network bridging — [signature] / [signedAt] carry the
+ * sender's Ed25519 signature; both nullable for the one-release rollout
+ * window.
  */
 @Serializable
 data class ReactionDto(
@@ -21,4 +27,23 @@ data class ReactionDto(
     val emoji: String?,
     val reactedAt: Long,
     val groupId: String? = null,
+    val signedAt: Long? = null,
+    val signature: String? = null,
+    val toUuid: String? = null,
+    val via: List<String>? = null,
+    val hopTtl: Int? = null,
 )
+
+fun ReactionDto.signaturePayload(signedAt: Long): ByteArray {
+    val b =
+        SignaturePayloadBuilder(SignatureDomain.REACTION)
+            .writeString(messageId)
+            .writeString(fromUuid)
+            .writeString(fromNickname)
+            .writeNullableString(emoji)
+            .writeLong(reactedAt)
+            .writeNullableString(groupId)
+            .writeLong(signedAt)
+    if (toUuid != null) b.writeNullableString(toUuid)
+    return b.build()
+}

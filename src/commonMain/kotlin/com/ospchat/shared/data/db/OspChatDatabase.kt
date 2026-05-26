@@ -36,7 +36,7 @@ import com.ospchat.shared.data.reactions.ReactionEntity
         GroupMessageEntity::class,
         CallEntity::class,
     ],
-    version = 10,
+    version = 11,
     exportSchema = false,
 )
 @ConstructedBy(OspChatDatabaseConstructor::class)
@@ -309,7 +309,21 @@ internal val MIGRATION_9_10 =
     }
 
 /**
- * The full set of migrations (v1 → v10). Apply these via
+ * v10 → v11: adds the `pub_key` column to the `peers` table. Phase 2b
+ * multi-network bridging — persisted TOFU pubkey pinning so the F9
+ * hijack defence survives a process restart. Defaults `null` for rows
+ * that pre-date phase 2a (we'll TOFU-pin the next time we see them
+ * advertise a `pk=` TXT).
+ */
+internal val MIGRATION_10_11 =
+    object : Migration(10, 11) {
+        override fun migrate(connection: SQLiteConnection) {
+            connection.execSQL("ALTER TABLE `peers` ADD COLUMN `pub_key` TEXT DEFAULT NULL")
+        }
+    }
+
+/**
+ * The full set of migrations (v1 → v11). Apply these via
  * `Room.databaseBuilder<OspChatDatabase>(...).addMigrations(*OSPCHAT_MIGRATIONS).build()`.
  *
  * Migration bodies are pure `execSQL` against [SQLiteConnection] — the Room
@@ -327,4 +341,5 @@ val OSPCHAT_MIGRATIONS: Array<Migration> =
         MIGRATION_7_8,
         MIGRATION_8_9,
         MIGRATION_9_10,
+        MIGRATION_10_11,
     )

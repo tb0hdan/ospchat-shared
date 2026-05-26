@@ -38,6 +38,13 @@ class NsdPeerDiscovery(
 
     @Volatile private var running: Boolean = false
 
+    private val pinnedPubkeys = ConcurrentHashMap<String, String>()
+
+    override fun preloadPinnedPubkeys(pins: Map<String, String>) {
+        pinnedPubkeys.clear()
+        pinnedPubkeys.putAll(pins)
+    }
+
     private val resolveLock = Any()
     private val resolveQueue: ArrayDeque<NsdServiceInfo> = ArrayDeque()
     private var resolveInFlight = false
@@ -47,6 +54,7 @@ class NsdPeerDiscovery(
         nickname: String,
         uuid: String,
         port: Int,
+        publicKeyB64: String?,
     ) {
         if (running) return
         require(port in 1..65535) { "port must be a valid bound TCP port, got $port" }
@@ -58,6 +66,9 @@ class NsdPeerDiscovery(
                 serviceType = SERVICE_TYPE
                 this.port = port
                 setAttribute(TXT_UUID, uuid)
+                if (publicKeyB64 != null) {
+                    setAttribute(TXT_PUBKEY, publicKeyB64)
+                }
             }
 
         val regListener = buildRegistrationListener()
@@ -237,28 +248,51 @@ class NsdPeerDiscovery(
         val uuid = serviceInfo.attributes[TXT_UUID]?.toString(Charsets.UTF_8)
         if (uuid.isNullOrBlank() || uuid == selfUuid) return
         val host = serviceInfo.host?.hostAddress ?: return
+        val pubkey =
+            serviceInfo.attributes[TXT_PUBKEY]
+                ?.toString(Charsets.UTF_8)
+                ?.takeIf { it.isNotBlank() }
 
-        val peer =
-            Peer(
-                uuid = uuid,
-                nickname = serviceInfo.serviceName,
-                host = host,
-                port = serviceInfo.port,
-            )
-        when (val result = _peers.protectedInsert(uuid, peer)) {
+        val candidate = Endpoint(host = host, port = serviceInfo.port)
+        val existingBefore = _peers.value[uuid]
+        val sawDifferentHost = existingBefore != null && existingBefore.candidates.none { it == candidate }
+
+        when (
+            val result =
+                _peers.protectedInsert(uuid, serviceInfo.serviceName, candidate, pubkey, pinnedPubkeys[uuid])
+        ) {
             PeerInsertResult.ACCEPTED -> {
                 nameToUuid[serviceInfo.serviceName] = uuid
+                if (sawDifferentHost) {
+                    Log.d(
+                        TAG,
+                        "peer uuid=$uuid gained candidate $host:${serviceInfo.port} " +
+                            "(via name=${serviceInfo.serviceName})",
+                    )
+                }
             }
 
             PeerInsertResult.DROPPED_AT_CAP -> {
                 Log.w(TAG, "peer cap reached ($MAX_PEERS); dropping name=${serviceInfo.serviceName}")
             }
 
-            PeerInsertResult.DROPPED_HIJACK -> {
+            PeerInsertResult.DROPPED_CANDIDATE_CAP -> {
                 Log.w(
                     TAG,
-                    "hijack guard: refusing to overwrite uuid=$uuid (existing host) " +
-                        "with name=${serviceInfo.serviceName}@$host — ignoring; result=$result",
+                    "candidate cap reached ($MAX_CANDIDATES_PER_PEER) for uuid=$uuid; " +
+                        "ignoring $host:${serviceInfo.port} from name=${serviceInfo.serviceName}; result=$result",
+                )
+            }
+
+            PeerInsertResult.DROPPED_PKH_MISMATCH -> {
+                // F9 phase-2a: same-UUID resolution from a different
+                // pubkey (or a dropped pubkey after we'd pinned one).
+                // Refuse to merge; pinned peer at pinned key stays
+                // reachable.
+                Log.w(
+                    TAG,
+                    "F9 pkh mismatch: uuid=$uuid; refusing $host:${serviceInfo.port} " +
+                        "from name=${serviceInfo.serviceName} (pinned pk=${existingBefore?.publicKey})",
                 )
             }
         }
@@ -268,5 +302,13 @@ class NsdPeerDiscovery(
         const val TAG = "NsdPeerDiscovery"
         const val SERVICE_TYPE = "_ospchat._tcp."
         const val TXT_UUID = "uuid"
+
+        /**
+         * Phase 2a multi-network bridging — base64-encoded raw Ed25519
+         * public key. Optional during the one-release rollout window;
+         * see the corresponding constant in `JmDnsPeerDiscovery` for
+         * the rationale.
+         */
+        const val TXT_PUBKEY = "pk"
     }
 }

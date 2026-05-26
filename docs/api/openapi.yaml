@@ -1,26 +1,90 @@
 openapi: 3.0.3
 info:
   title: OSPChat Peer API
-  version: 0.10.0
+  version: 0.14.0
   description: |
     REST API exposed by every OSPChat peer on the local network. Each running
     instance binds an embedded Ktor server to an ephemeral TCP port; that port
     is advertised over mDNS / DNS-SD (`_ospchat._tcp.`) together with the
-    peer's stable UUID (TXT attribute `uuid`).
+    peer's stable UUID (TXT attribute `uuid`) and its base64-encoded Ed25519
+    public key (TXT attribute `pk`).
 
     All endpoints are grouped under `/v1`.
 
     ## Trust model
 
-    Peers trust each other on first sight (TOFU). Authentication is purely
-    a sanity check:
-      - `POST /v1/messages` requires the body to include a `fromUuid` that
-        the receiver previously discovered via NSD.
-      - The receiver also verifies that the request's source IP matches the
-        host address it learned for that UUID from NSD resolution.
+    Phase 2 multi-network bridging introduces per-install Ed25519 keypairs and
+    signed message DTOs:
 
-    There is no TLS, no signature, and no replay protection. This API is
-    intended for trusted LAN environments only.
+      - The advertised `pk` (also returned by `GET /v1/info` as `publicKey`)
+        is TOFU-pinned by the receiver on first sight. Subsequent mDNS
+        resolutions of the same UUID with a different `pk` are rejected, so
+        an attacker can't displace a previously-pinned identity. Persistent
+        pinning carries the protection across process restarts.
+      - Every body-bearing peer-trusted POST (`/v1/messages`,
+        `/v1/read-receipts`, `/v1/reactions`, all `/v1/groups/*` except
+        `/v1/groups/messages` whose inner pieces are signed individually)
+        carries a base64 Ed25519 `signature` over a canonical payload plus
+        a `signedAt` epoch-millisecond timestamp. Receivers verify against
+        the sender's pinned pubkey and reject signedAt outside a ±5 minute
+        replay window.
+      - Source-IP equality (origin matches any candidate of the named
+        sender's discovered peer entry) remains in place as a cheap
+        first-pass filter.
+
+    During the phase 2b rollout window receivers tolerate unsigned bodies
+    with a WARN log — clients running pre-2b builds still inter-operate.
+    A future API version will flip to strict-require.
+
+    Phase 3 multi-network bridging extends signatures to the call signaling
+    DTOs (`/v1/call/{offer,answer,ice,hangup}`) and adds the new
+    `POST /v1/call/relay-cred` endpoint that issues short-lived TURN
+    credentials (RFC 5766 long-term credentials in TURN-REST-API format,
+    5-minute TTL). The TURN server itself is a pure-Kotlin RFC 5766 subset
+    embedded in every peer process; the existing phase-4 `relayEnabled`
+    flag gates both message-DTO forwarding and voice TURN relay (one
+    toggle, two purposes).
+
+    Phase 5 (PR 3) extends the phase-4 `toUuid` / `via` / `hopTtl`
+    bridging fields onto the four call DTOs, so the SDP signaling itself
+    can hop through a relay-enabled bridge when the two peers can't reach
+    each other directly. TURN handles the media plane; phase-4-style
+    relay handles the signaling plane. Both layers required for a true
+    cross-network voice call.
+
+    Binary fetches (`/v1/attachments`, `/v1/avatar`, `/v1/notify-refresh`)
+    remain unsigned for now.
+
+    ## Cross-LAN relay (phase 4)
+
+    Multi-homed peers (e.g. a desktop on two LANs that aren't routed
+    between each other) can relay signed DTOs between unrelated sides:
+
+      - Every signed DTO gains `toUuid` (final recipient), `via` (hop
+        list, intermediates append themselves), and `hopTtl`
+        (decremented per hop, starts at 3 by default). `toUuid` is
+        included in the signature payload via an append-only extension
+        — phase-2b clients with `toUuid == null` sign byte-identical
+        bytes to a phase-4 client with `toUuid == null`, so signatures
+        remain wire-compatible. `via` and `hopTtl` are *not* signed
+        because intermediates mutate them.
+      - `GET /v1/info` now also returns `peers: [GossipedPeer]` (the
+        responder's currently-discovered peers, minus the requester
+        themselves and any peer without a known pubkey) plus
+        `relayEnabled: bool`. The requester learns about
+        otherwise-unreachable peers and which bridges are willing to
+        forward.
+      - When a route receives a signed DTO with `toUuid != self`, it
+        either forwards (relay opt-in, target in discovery, TTL > 0,
+        no loop in `via`) or rejects with `relay_refused` /
+        `relay_unroutable`. Receivers verify the *original sender's*
+        signature, not the intermediate's, so relays cannot tamper.
+      - Source-IP equality is skipped for signed requests — relay
+        sources legitimately differ from the named `fromUuid`. Identity
+        is asserted by the signature, not the IP.
+
+    There is no TLS. This API is intended for trusted LAN environments
+    (or LAN-equivalent overlays like Tailscale).
 servers:
   - url: http://{host}:{port}
     description: A single peer reachable on the local network.
@@ -171,6 +235,48 @@ paths:
               schema:
                 type: string
                 format: binary
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/peer-avatar/{uuid}:
+    get:
+      tags: [identity]
+      summary: Stream a bridge's locally-cached copy of a phantom peer's avatar (JPEG bytes).
+      description: |
+        Phase 4 multi-network bridging — when peer A and peer C sit on
+        unrouted LANs but both reach a bridge B that's multi-homed, A
+        learns about C via B's `/v1/info.peers` gossip but can't reach
+        C directly. This endpoint on B serves the avatar bytes B has
+        cached for C (from B's own direct sync against C). Receivers
+        notice an avatar update via the `avatarHash` field on the
+        corresponding `GossipedPeer` entry and pull the bytes from one
+        of the bridges that vouched for the target.
+
+        Responds 404 when B has no cached avatar for {uuid} (B hasn't
+        synced from {uuid} yet, or {uuid} has no custom avatar set).
+
+        Authenticated by source IP against the live NSD snapshot, like
+        `/v1/avatar` and `/v1/attachments/{messageId}`.
+      operationId: getPeerAvatar
+      parameters:
+        - in: path
+          name: uuid
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: UUID of the gossiped peer whose cached avatar to retrieve.
+      responses:
+        "200":
+          description: The cached avatar JPEG bytes.
+          content:
+            "image/jpeg":
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/Error"
         "401":
           $ref: "#/components/responses/Error"
         "404":
@@ -475,6 +581,50 @@ paths:
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
+  /v1/call/relay-cred:
+    post:
+      tags: [calls]
+      summary: Request short-lived TURN credentials from a relay-enabled bridge.
+      description: |
+        Phase 3 multi-network bridging. Requesters POST this to a bridge —
+        any peer in the requester's discovery snapshot whose `/v1/info`
+        advertised `relayEnabled: true` — to obtain a TURN username /
+        credential pair that lets libwebrtc gather `relay`-class ICE
+        candidates. The credential expires 5 minutes after issue (matches
+        the signature replay window so a leaked response can't outlive
+        its own signature).
+
+        The response is signed by the bridge so the requester can verify
+        the credentials weren't forged in transit by a LAN MitM. During
+        the phase-3 rollout window the response signature is tolerated-
+        absent for the same reason as other signed DTOs.
+
+        Bridges that haven't started a TURN server (`relayEnabled=false`
+        at boot, or no bound interfaces) respond `503 relay_unavailable`.
+        Pre-phase-3 peers respond `404` — callers treat this as
+        "no relay available" and fall back to direct ICE.
+      operationId: postCallRelayCred
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelayCredRequest"
+      responses:
+        "200":
+          description: TURN credentials issued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelayCredResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          description: Bridge has relayEnabled=false (`relay_denied`).
+          $ref: "#/components/responses/Error"
+        "503":
+          description: TURN server not running (`relay_unavailable`).
+          $ref: "#/components/responses/Error"
   /v1/groups/leave:
     post:
       tags: [groups]
@@ -525,6 +675,36 @@ components:
             SHA-256 hex of the peer's custom avatar JPEG, or `null` when no
             custom avatar is set. Receivers re-fetch `GET /v1/avatar` when
             this value changes from what they have cached.
+        publicKey:
+          type: string
+          nullable: true
+          description: |
+            Phase 2a multi-network bridging — base64-encoded raw Ed25519
+            public key (32 bytes → 44 b64 chars), same as the `pk` mDNS
+            TXT attribute. Receivers cross-check this against the TXT
+            pubkey when both are present; mismatch logs a warning but
+            doesn't reject. `null` for peers running a pre-phase-2a build.
+        peers:
+          type: array
+          nullable: true
+          maxItems: 64
+          description: |
+            Phase 4 multi-network bridging — peers this responder
+            currently sees via discovery, minus the requester themselves
+            and any peer without a known pubkey. The requester learns
+            about peers reachable through this responder as a bridge.
+            Empty `[]` for peers with nothing to gossip; `null` for
+            pre-phase-4 builds that don't know about the field.
+          items:
+            $ref: "#/components/schemas/GossipedPeer"
+        relayEnabled:
+          type: boolean
+          nullable: true
+          description: |
+            Phase 4 multi-network bridging — `true` when this peer will
+            forward signed DTOs whose `toUuid` is set to another peer
+            it knows. `false` (default) or `null` means relay requests
+            are refused with `relay_refused`.
     IncomingMessage:
       type: object
       required: [id, fromUuid, fromNickname, body, sentAt]
@@ -559,6 +739,16 @@ components:
           description: |
             Optional image attachment. If present, the receiver should fetch
             the binary via `GET /v1/attachments/{id}` on the sender.
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
+        toUuid:
+          $ref: "#/components/schemas/ToUuid"
+        via:
+          $ref: "#/components/schemas/Via"
+        hopTtl:
+          $ref: "#/components/schemas/HopTtl"
     Attachment:
       type: object
       required: [mimeType, sizeBytes, width, height]
@@ -618,6 +808,16 @@ components:
             Non-null when the reaction is on a group message — the receiver
             then validates `fromUuid` against group membership. Omit for DM
             reactions.
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
+        toUuid:
+          $ref: "#/components/schemas/ToUuid"
+        via:
+          $ref: "#/components/schemas/Via"
+        hopTtl:
+          $ref: "#/components/schemas/HopTtl"
     ReadReceipt:
       type: object
       required: [fromUuid, upToSentAt]
@@ -636,6 +836,16 @@ components:
             `READ`. Rows still in `SENDING` (in-flight) or `FAILED`
             (terminal error) are left alone — the reader will need to
             send a fresh receipt once the message settles.
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
+        toUuid:
+          $ref: "#/components/schemas/ToUuid"
+        via:
+          $ref: "#/components/schemas/Via"
+        hopTtl:
+          $ref: "#/components/schemas/HopTtl"
     GroupKind:
       type: string
       enum: [CHAT, BROADCAST]
@@ -681,6 +891,16 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/GroupMember"
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
+        toUuid:
+          $ref: "#/components/schemas/ToUuid"
+        via:
+          $ref: "#/components/schemas/Via"
+        hopTtl:
+          $ref: "#/components/schemas/HopTtl"
     GroupMessage:
       type: object
       required: [id, fromUuid, fromNickname, body, sentAt]
@@ -698,6 +918,16 @@ components:
         sentAt:
           type: integer
           format: int64
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
+        toUuid:
+          $ref: "#/components/schemas/ToUuid"
+        via:
+          $ref: "#/components/schemas/Via"
+        hopTtl:
+          $ref: "#/components/schemas/HopTtl"
     GroupMessagePost:
       type: object
       required: [snapshot, message]
@@ -727,6 +957,16 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/GroupSyncCursor"
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
+        toUuid:
+          $ref: "#/components/schemas/ToUuid"
+        via:
+          $ref: "#/components/schemas/Via"
+        hopTtl:
+          $ref: "#/components/schemas/HopTtl"
     GroupSyncPayload:
       type: object
       required: [snapshot, messages]
@@ -764,6 +1004,105 @@ components:
         fromUuid:
           type: string
           format: uuid
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
+        toUuid:
+          $ref: "#/components/schemas/ToUuid"
+        via:
+          $ref: "#/components/schemas/Via"
+        hopTtl:
+          $ref: "#/components/schemas/HopTtl"
+    GossipedPeer:
+      type: object
+      required: [uuid, nickname, publicKey]
+      description: |
+        Phase 4 multi-network bridging — projection of one of the
+        responder's currently-discovered peers, returned in
+        `Info.peers`. Excludes host/port (unreachable from the
+        requester's perspective). The public key lets the requester
+        verify signed DTOs that later arrive via a bridge claiming
+        to come from this peer.
+      properties:
+        uuid:
+          type: string
+          format: uuid
+        nickname:
+          type: string
+          minLength: 1
+          maxLength: 32
+        publicKey:
+          type: string
+          description: Base64-encoded raw Ed25519 public key (32 bytes → 44 b64 chars).
+        avatarHash:
+          type: string
+          nullable: true
+          description: |
+            Phase 4 multi-network bridging — SHA-256 hex of the gossiped
+            peer's avatar JPEG as last seen by this responder. `null`
+            when the peer has no custom avatar set or when the responder
+            hasn't cached the bytes. Receivers compare to their own
+            cached hash and, on mismatch, pull the bytes through this
+            responder via `GET /v1/peer-avatar/{uuid}`.
+    ToUuid:
+      type: string
+      format: uuid
+      nullable: true
+      description: |
+        Phase 4 multi-network bridging — final intended recipient when
+        the request is being relayed through one or more intermediates.
+        When set on a request the immediate receiver gets, the receiver
+        either forwards (`toUuid != self.uuid`) or consumes locally
+        (`toUuid == self.uuid` or `toUuid == null`). Included in the
+        DTO's signature so intermediates cannot redirect.
+    Via:
+      type: array
+      nullable: true
+      description: |
+        Phase 4 multi-network bridging — UUIDs of intermediate peers
+        that have relayed this DTO. Each forwarding hop appends its own
+        UUID. Receivers reject if their own UUID is already in `via`
+        (loop detection). **Not** part of the signature — intermediates
+        mutate it.
+      items:
+        type: string
+        format: uuid
+    HopTtl:
+      type: integer
+      format: int32
+      nullable: true
+      minimum: 0
+      description: |
+        Phase 4 multi-network bridging — remaining hops the DTO may
+        take. Each forwarding intermediate decrements by one; a 0
+        value at a forwarder causes 400 `relay_unroutable`. Originators
+        leaving this null get a default of 3 (covers one bridge hop
+        plus safety). **Not** part of the signature.
+    SignedAt:
+      type: integer
+      format: int64
+      nullable: true
+      minimum: 0
+      description: |
+        Phase 2b multi-network bridging — Unix epoch milliseconds when the
+        sender produced the [signature]. Receivers reject signatures whose
+        `signedAt` is more than ±5 minutes from local time as a replay-
+        protection measure. `null` during the phase 2b rollout window for
+        peers running pre-2b builds; rejected once the rollout completes.
+    Signature:
+      type: string
+      nullable: true
+      description: |
+        Phase 2b multi-network bridging — base64-encoded raw Ed25519
+        signature (64 bytes → 88 b64 chars) over a canonical byte payload
+        derived from the DTO's fields plus [signedAt]. The exact byte
+        layout is defined per-DTO in `commonMain/.../crypto/SignaturePayload.kt`
+        — see the `SignatureDomain` constants. The signing key is the
+        sender's per-install Ed25519 key, advertised in the `pk` mDNS TXT
+        attribute and `GET /v1/info.publicKey`. `null` during phase 2b
+        rollout for peers that haven't upgraded; receivers tolerate but
+        log a WARN. A future release flips to reject-on-absent.
     CallOffer:
       type: object
       required: [callId, fromUuid, fromNickname, sdp, sentAt]
@@ -787,6 +1126,16 @@ components:
           type: integer
           format: int64
           description: Unix epoch milliseconds when the caller initiated the call.
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
+        toUuid:
+          $ref: "#/components/schemas/ToUuid"
+        via:
+          $ref: "#/components/schemas/Via"
+        hopTtl:
+          $ref: "#/components/schemas/HopTtl"
     CallAnswer:
       type: object
       required: [callId, fromUuid, sdp]
@@ -800,6 +1149,16 @@ components:
         sdp:
           type: string
           description: SDP answer text as produced by `RTCPeerConnection.createAnswer`.
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
+        toUuid:
+          $ref: "#/components/schemas/ToUuid"
+        via:
+          $ref: "#/components/schemas/Via"
+        hopTtl:
+          $ref: "#/components/schemas/HopTtl"
     CallIce:
       type: object
       required: [callId, fromUuid, candidate]
@@ -821,6 +1180,16 @@ components:
           type: integer
           default: 0
           description: Zero-based index of the m-section this candidate belongs to.
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
+        toUuid:
+          $ref: "#/components/schemas/ToUuid"
+        via:
+          $ref: "#/components/schemas/Via"
+        hopTtl:
+          $ref: "#/components/schemas/HopTtl"
     CallHangup:
       type: object
       required: [callId, fromUuid]
@@ -843,6 +1212,81 @@ components:
             when an incoming offer arrives during another active call.
             `NO_ANSWER` is the caller-side ring timeout. `FAILED` is set
             on local connection-layer errors.
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
+        toUuid:
+          $ref: "#/components/schemas/ToUuid"
+        via:
+          $ref: "#/components/schemas/Via"
+        hopTtl:
+          $ref: "#/components/schemas/HopTtl"
+    RelayCredRequest:
+      type: object
+      required: [fromUuid, requestedAt]
+      description: |
+        Phase 3 multi-network bridging — request body for
+        `POST /v1/call/relay-cred`. Signed so the bridge can verify the
+        requester's identity (the response binds the requester's UUID
+        into the TURN username, preventing credential reuse by other peers).
+      properties:
+        fromUuid:
+          type: string
+          format: uuid
+          description: Requester's stable identity.
+        requestedAt:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the request was built.
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
+    RelayCredResponse:
+      type: object
+      required: [fromUuid, uris, username, credential, expiresAt]
+      description: |
+        Phase 3 — TURN credentials issued by a relay-enabled bridge. The
+        response is signed by the bridge so the requester can verify the
+        credentials weren't forged by a LAN MitM. `uris` lists one entry
+        per externally-routable interface the bridge is bound to; the
+        requester adds them all to `RTCConfiguration.iceServers` and
+        libwebrtc picks whichever pair wins.
+      properties:
+        fromUuid:
+          type: string
+          format: uuid
+          description: Bridge's UUID — verified against TOFU-pinned pubkey for the response signature.
+        uris:
+          type: array
+          items:
+            type: string
+          description: |
+            TURN URIs, one per externally-routable interface. Format:
+            `turn:<ip>:<port>?transport=udp`. Phase 3 supports UDP only.
+        username:
+          type: string
+          description: |
+            TURN long-term credential username. Encodes the credential
+            expiry epoch and the requesting peer's UUID (RFC 8155 /
+            TURN-REST-API style) so the TURN server can verify
+            statelessly. Pass directly into `RTCIceServer.username`.
+        credential:
+          type: string
+          description: |
+            Base64(HMAC-SHA1(per-process secret, username)). Pass directly
+            into `RTCIceServer.credential` / `IceServer.password`.
+        expiresAt:
+          type: integer
+          format: int64
+          description: |
+            Unix epoch milliseconds at which these credentials stop being
+            accepted by the TURN server. Approximately `requestedAt + 5 min`.
+        signedAt:
+          $ref: "#/components/schemas/SignedAt"
+        signature:
+          $ref: "#/components/schemas/Signature"
     Error:
       type: object
       required: [error]
@@ -855,6 +1299,12 @@ components:
             - unknown_peer
             - address_mismatch
             - internal_error
+            - signature_invalid
+            - signature_replay
+            - relay_refused
+            - relay_unroutable
+            - relay_denied
+            - relay_unavailable
           description: |
             Machine-readable error identifier. Clients may switch on this
             value to render appropriate UI; it will never contain whitespace.

@@ -1,5 +1,6 @@
 package com.ospchat.shared.net.dto
 
+import com.ospchat.shared.crypto.SignaturePayloadBuilder
 import kotlinx.serialization.Serializable
 
 /*
@@ -10,12 +11,32 @@ import kotlinx.serialization.Serializable
  * plus the sender's stable fromUuid for the standard
  * verifiedPeerOrRespond authentication check.
  *
- * Media itself never flows through these endpoints — only SDP / ICE. The
- * actual audio rides UDP via libwebrtc once ICE has connected. ICE gathering
- * is restricted to host candidates (LAN-only); no STUN, no TURN.
+ * Phase 3 multi-network bridging: every DTO now carries optional
+ * `signedAt` + `signature` fields (same pattern as the phase-2b signed DTOs
+ * — see [com.ospchat.shared.crypto.SignaturePayloadBuilder]). Receivers run
+ * the standard `verifySignatureOrTolerate` check; null fields trigger the
+ * tolerate-unsigned rollout path that keeps pre-phase-3 peers inter-operable.
+ *
+ * Media itself never flows through these endpoints — only SDP / ICE. Audio
+ * rides UDP via libwebrtc once ICE has connected. Phase 3 introduces the
+ * `/v1/call/relay-cred` endpoint that issues short-lived TURN credentials so
+ * libwebrtc can also gather relayed candidates when peers can't reach each
+ * other directly.
  */
 
-/** `POST /v1/call/offer` — caller invites callee to a new audio call. */
+/**
+ * `POST /v1/call/offer` — caller invites callee to a new audio call.
+ *
+ * Phase 5 multi-network bridging: `toUuid` / `via` / `hopTtl` enable
+ * relayed signaling through bridge peers, mirroring the phase-4 pattern
+ * for message DTOs. When the originator and target can't reach each
+ * other directly, the originator POSTs to a relay-enabled bridge with
+ * `toUuid` set to the final target's UUID; the bridge sees
+ * `toUuid != self`, appends itself to `via`, decrements `hopTtl`, and
+ * forwards. The signature commits `toUuid` (append-only over the
+ * phase-3 payload) so the target can verify the originator's identity
+ * regardless of how many hops the offer took.
+ */
 @Serializable
 data class CallOfferDto(
     val callId: String,
@@ -23,6 +44,11 @@ data class CallOfferDto(
     val fromNickname: String,
     val sdp: String,
     val sentAt: Long,
+    val signedAt: Long? = null,
+    val signature: String? = null,
+    val toUuid: String? = null,
+    val via: List<String>? = null,
+    val hopTtl: Int? = null,
 )
 
 /** `POST /v1/call/answer` — callee accepts the offer; carries the answer SDP. */
@@ -31,6 +57,11 @@ data class CallAnswerDto(
     val callId: String,
     val fromUuid: String,
     val sdp: String,
+    val signedAt: Long? = null,
+    val signature: String? = null,
+    val toUuid: String? = null,
+    val via: List<String>? = null,
+    val hopTtl: Int? = null,
 )
 
 /**
@@ -45,6 +76,11 @@ data class CallIceDto(
     val candidate: String,
     val sdpMid: String? = null,
     val sdpMLineIndex: Int = 0,
+    val signedAt: Long? = null,
+    val signature: String? = null,
+    val toUuid: String? = null,
+    val via: List<String>? = null,
+    val hopTtl: Int? = null,
 )
 
 /**
@@ -62,4 +98,118 @@ data class CallHangupDto(
     val callId: String,
     val fromUuid: String,
     val reason: String? = null,
+    val signedAt: Long? = null,
+    val signature: String? = null,
+    val toUuid: String? = null,
+    val via: List<String>? = null,
+    val hopTtl: Int? = null,
 )
+
+/**
+ * `POST /v1/call/relay-cred` — request short-lived TURN credentials from a
+ * relay-enabled bridge so libwebrtc can gather relay-class ICE candidates.
+ * Phase 3 multi-network bridging.
+ *
+ * The bridge issues credentials valid for 5 minutes (matching the existing
+ * signature replay window) bound to the requesting peer's UUID — the username
+ * encodes the expiry timestamp so the TURN server can verify statelessly
+ * (RFC 8155 / TURN-REST-API style).
+ */
+@Serializable
+data class RelayCredRequestDto(
+    val fromUuid: String,
+    val requestedAt: Long,
+    val signedAt: Long? = null,
+    val signature: String? = null,
+)
+
+/**
+ * Response to `POST /v1/call/relay-cred`. The bridge signs this so the
+ * requester can verify the credentials weren't forged in transit by a peer
+ * that hijacked the LAN response.
+ *
+ * `uris` lists one TURN URI per externally-routable interface the bridge is
+ * bound to; the requester adds them all to its `RTCConfiguration.iceServers`
+ * and libwebrtc picks whichever ICE pair wins.
+ */
+@Serializable
+data class RelayCredResponseDto(
+    val fromUuid: String,
+    val uris: List<String>,
+    val username: String,
+    val credential: String,
+    val expiresAt: Long,
+    val signedAt: Long? = null,
+    val signature: String? = null,
+)
+
+// ---- Signature payload extensions ------------------------------------------
+
+internal fun CallOfferDto.signaturePayload(signedAt: Long): ByteArray {
+    val b =
+        SignaturePayloadBuilder(com.ospchat.shared.crypto.SignatureDomain.CALL_OFFER)
+            .writeString(callId)
+            .writeString(fromUuid)
+            .writeString(fromNickname)
+            .writeString(sdp)
+            .writeLong(sentAt)
+            .writeLong(signedAt)
+    // Phase 5 append-only: pre-PR-3 originators (toUuid==null) skip this,
+    // so their payload is byte-identical to phase-3. PR-3+ originators
+    // signing a relayed offer commit toUuid into the signature so the
+    // target can verify their identity regardless of how the offer hopped.
+    if (toUuid != null) b.writeNullableString(toUuid)
+    return b.build()
+}
+
+internal fun CallAnswerDto.signaturePayload(signedAt: Long): ByteArray {
+    val b =
+        SignaturePayloadBuilder(com.ospchat.shared.crypto.SignatureDomain.CALL_ANSWER)
+            .writeString(callId)
+            .writeString(fromUuid)
+            .writeString(sdp)
+            .writeLong(signedAt)
+    if (toUuid != null) b.writeNullableString(toUuid)
+    return b.build()
+}
+
+internal fun CallIceDto.signaturePayload(signedAt: Long): ByteArray {
+    val b =
+        SignaturePayloadBuilder(com.ospchat.shared.crypto.SignatureDomain.CALL_ICE)
+            .writeString(callId)
+            .writeString(fromUuid)
+            .writeString(candidate)
+            .writeNullableString(sdpMid)
+            .writeInt(sdpMLineIndex)
+            .writeLong(signedAt)
+    if (toUuid != null) b.writeNullableString(toUuid)
+    return b.build()
+}
+
+internal fun CallHangupDto.signaturePayload(signedAt: Long): ByteArray {
+    val b =
+        SignaturePayloadBuilder(com.ospchat.shared.crypto.SignatureDomain.CALL_HANGUP)
+            .writeString(callId)
+            .writeString(fromUuid)
+            .writeNullableString(reason)
+            .writeLong(signedAt)
+    if (toUuid != null) b.writeNullableString(toUuid)
+    return b.build()
+}
+
+internal fun RelayCredRequestDto.signaturePayload(signedAt: Long): ByteArray =
+    SignaturePayloadBuilder(com.ospchat.shared.crypto.SignatureDomain.RELAY_CRED_REQUEST)
+        .writeString(fromUuid)
+        .writeLong(requestedAt)
+        .writeLong(signedAt)
+        .build()
+
+internal fun RelayCredResponseDto.signaturePayload(signedAt: Long): ByteArray =
+    SignaturePayloadBuilder(com.ospchat.shared.crypto.SignatureDomain.RELAY_CRED_RESPONSE)
+        .writeString(fromUuid)
+        .writeList(uris) { writeString(it) }
+        .writeString(username)
+        .writeString(credential)
+        .writeLong(expiresAt)
+        .writeLong(signedAt)
+        .build()

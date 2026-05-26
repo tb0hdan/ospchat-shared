@@ -38,6 +38,18 @@ interface AvatarStore {
     /** Read the local user's avatar JPEG bytes for [hash], or `null` if not stored. */
     fun readSelf(hash: String): ByteArray?
 
+    /**
+     * Read the cached avatar JPEG bytes for peer [uuid] at [hash], or `null`
+     * if no file matches. Phase 4 multi-network bridging: a relay-enabled
+     * bridge serves these to phantom-peer consumers via
+     * `GET /v1/peer-avatar/{uuid}` when the consumer can't reach the
+     * original peer directly.
+     */
+    fun readPeer(
+        uuid: String,
+        hash: String,
+    ): ByteArray?
+
     /** Delete any local self-avatar files except the one for [keepHash] (if any). */
     fun cleanupSelfExcept(keepHash: String?)
 

@@ -21,7 +21,15 @@ class DiscoveryRepository(
         nickname: String,
         uuid: String,
         port: Int,
-    ) = discovery.start(nickname, uuid, port)
+        publicKeyB64: String? = null,
+    ) = discovery.start(nickname, uuid, port, publicKeyB64)
+
+    /**
+     * Phase 2b multi-network bridging — forward persistent TOFU pubkey pins
+     * to the underlying [PeerDiscoveryService] before [start]. Consumers
+     * load these from `PeerDao.loadPinnedPubkeys()` at app startup.
+     */
+    fun preloadPinnedPubkeys(pins: Map<String, String>) = discovery.preloadPinnedPubkeys(pins)
 
     fun stop() = discovery.stop()
 

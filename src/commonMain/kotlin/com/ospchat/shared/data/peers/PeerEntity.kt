@@ -31,4 +31,12 @@ data class PeerEntity(
     @ColumnInfo(name = "avatar_hash") val avatarHash: String? = null,
     @ColumnInfo(name = "avatar_local_path") val avatarLocalPath: String? = null,
     @ColumnInfo(name = "is_contact") val isContact: Boolean = false,
+    /**
+     * Base64-encoded Ed25519 public key, set the first time we resolve
+     * the peer via mDNS during a phase 2a-or-later session. TOFU-pinned
+     * (never overwritten by a different value once non-null). `null`
+     * means we've only ever seen this peer on a pre-phase-2a build.
+     * Phase 2b multi-network bridging — see `docs/SECURITY.md` F9.
+     */
+    @ColumnInfo(name = "pub_key") val pubKey: String? = null,
 )

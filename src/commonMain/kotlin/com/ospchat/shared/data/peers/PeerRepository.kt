@@ -26,21 +26,44 @@ class PeerRepository(
     private val historyDao: PeerHistoryDao,
     private val historyRecorder: PeerHistoryRecorder,
     private val discoveryRepository: DiscoveryRepository,
+    /**
+     * Phase 4 multi-network bridging — when non-null, [toRecord] computes
+     * `isOnline` and `bridgeNickname` from the live route resolution
+     * (direct vs. bridged) rather than just lastHost emptiness. Bundled
+     * with the gossip + relay flows so [observeAll] re-emits when bridge
+     * availability changes.
+     */
+    private val peerRouter: PeerRouter? = null,
+    private val gossipedPeerStore: GossipedPeerStore? = null,
+    private val relayBridgeRegistry: RelayBridgeRegistry? = null,
 ) {
     /**
      * Every persisted peer joined with live state. Sorted online-first,
      * then by `lastSeenAt` descending, then alphabetically.
+     *
+     * Phase 4: combines in gossip + relay-bridge-registry flows so the
+     * "online via bridge" status reacts to bridges coming online /
+     * toggling relay / leaving discovery.
      */
     fun observeAll(): Flow<List<PeerRecord>> =
         combine(
             peerDao.observeAll(),
             messageDao.observeUnreadCounts(),
             discoveryRepository.peerSnapshot,
-        ) { stored, unread, live ->
+            // Empty default flows when phase-4 components aren't wired,
+            // so legacy code paths (tests, pre-phase-4 graphs) keep
+            // working unchanged.
+            gossipedPeerStore?.peers ?: kotlinx.coroutines.flow.flowOf(emptyMap()),
+            relayBridgeRegistry?.bridges ?: kotlinx.coroutines.flow.flowOf(emptySet()),
+        ) { stored, unread, live, _, _ ->
             val unreadMap = unread.associate { it.peerUuid to it.count }
             stored
-                .map { entity -> entity.toRecord(live[entity.uuid], unreadMap[entity.uuid] ?: 0) }
-                .sortedWith(
+                .map { entity ->
+                    entity.toRecord(
+                        live = live[entity.uuid],
+                        unreadCount = unreadMap[entity.uuid] ?: 0,
+                    )
+                }.sortedWith(
                     compareByDescending<PeerRecord> { it.isOnline }
                         .thenByDescending { it.lastSeenAt }
                         .thenBy { it.nickname.lowercase() },
@@ -79,7 +102,9 @@ class PeerRepository(
             peerDao.observeAll(),
             messageDao.observeUnreadCounts(),
             discoveryRepository.peerSnapshot,
-        ) { stored, unread, live ->
+            gossipedPeerStore?.peers ?: kotlinx.coroutines.flow.flowOf(emptyMap()),
+            relayBridgeRegistry?.bridges ?: kotlinx.coroutines.flow.flowOf(emptySet()),
+        ) { stored, unread, live, _, _ ->
             val entity = stored.firstOrNull { it.uuid == uuid } ?: return@combine null
             val unreadCount = unread.firstOrNull { it.peerUuid == uuid }?.count ?: 0
             entity.toRecord(live[uuid], unreadCount)
@@ -121,6 +146,11 @@ class PeerRepository(
                 avatarLocalPath = existing?.avatarLocalPath,
                 // Preserve the contact promotion across re-discovery.
                 isContact = existing?.isContact ?: false,
+                // Phase 2b TOFU pubkey: pin the first non-null we ever
+                // see and stick with it. Phase 2a in-memory pin already
+                // refuses to merge same-UUID resolutions with a
+                // different pubkey, so we trust the value flowing in.
+                pubKey = existing?.pubKey ?: peer.publicKey,
             ),
         )
         historyRecorder.record(peer = peer, now = now)
@@ -149,17 +179,31 @@ class PeerRepository(
     private fun PeerEntity.toRecord(
         live: Peer?,
         unreadCount: Int,
-    ): PeerRecord =
-        PeerRecord(
+    ): PeerRecord {
+        // Phase 4 multi-network bridging — when not in direct discovery,
+        // ask PeerRouter if a relay-enabled bridge is currently
+        // available. `bridgeRoute` is non-null only when the route is
+        // *bridged* (toUuid set); direct routes resolve to a `null`
+        // toUuid and are handled by the `live != null` branch.
+        val bridgeRoute =
+            if (live != null) {
+                null
+            } else {
+                peerRouter?.routeTo(uuid)?.takeIf { it.toUuid != null }
+            }
+        val bridgeNickname = bridgeRoute?.nextHop?.nickname
+        return PeerRecord(
             uuid = uuid,
             nickname = live?.nickname ?: nickname,
             host = live?.host ?: lastHost,
             port = live?.port ?: lastPort,
-            isOnline = live != null,
+            isOnline = live != null || bridgeRoute != null,
             firstSeenAt = firstSeenAt,
             lastSeenAt = lastSeenAt,
             unreadCount = unreadCount,
             avatarLocalPath = avatarLocalPath,
             isContact = isContact,
+            bridgeNickname = bridgeNickname,
         )
+    }
 }

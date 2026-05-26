@@ -8,6 +8,7 @@ import java.nio.file.Files
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -75,5 +76,19 @@ class IdentityRepositoryTest {
             assertEquals("deadbeef", repo.currentAvatarHash())
             repo.setAvatarHash(null)
             assertNull(repo.currentAvatarHash())
+        }
+
+    @Test
+    fun ensureSigningKeyPairIsStableAcrossCalls() =
+        runTest {
+            // Second call must read the persisted seed (since
+            // SigningCrypto.generate produces a fresh key every time,
+            // matching pubkey/seed on call N+1 proves the round-trip
+            // through DataStore works).
+            val repo = newRepo("signing.preferences_pb")
+            val first = repo.ensureSigningKeyPair()
+            val second = repo.ensureSigningKeyPair()
+            assertContentEquals(first.publicKeyBytes(), second.publicKeyBytes())
+            assertContentEquals(first.privateSeedBytes(), second.privateSeedBytes())
         }
 }

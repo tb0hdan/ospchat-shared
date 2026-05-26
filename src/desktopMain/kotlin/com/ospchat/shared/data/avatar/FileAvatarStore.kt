@@ -54,6 +54,14 @@ class FileAvatarStore(
         return if (target.isFile) target.readBytes() else null
     }
 
+    override fun readPeer(
+        uuid: String,
+        hash: String,
+    ): ByteArray? {
+        val target = peerTarget(uuid, hash)
+        return if (target.isFile) target.readBytes() else null
+    }
+
     override fun cleanupSelfExcept(keepHash: String?) {
         root.listFiles { f -> f.name.startsWith("self-") }?.forEach { file ->
             val keep = keepHash != null && file.name == "self-$keepHash.jpg"

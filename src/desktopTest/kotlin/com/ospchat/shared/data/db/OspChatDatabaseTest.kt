@@ -347,7 +347,7 @@ class OspChatDatabaseTest {
     @Test
     fun migrationsArrayCoversAllVersions() {
         // Defensive: any future migration added must be wired into the array
-        assertEquals(9, OSPCHAT_MIGRATIONS.size)
+        assertEquals(10, OSPCHAT_MIGRATIONS.size)
         assertTrue(OSPCHAT_MIGRATIONS.all { it.startVersion + 1 == it.endVersion })
     }
 

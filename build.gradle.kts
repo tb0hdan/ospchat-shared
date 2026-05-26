@@ -70,10 +70,15 @@ kotlin {
         val desktopMain by getting {
             dependencies {
                 implementation(libs.jmdns)
+                // Bouncy Castle for Ed25519. JDK 17 has Ed25519 in
+                // java.security, but Android API 26-32 (our floor) does not,
+                // so we use BC on both JVM and Android for one code path.
+                implementation(libs.bouncycastle)
             }
         }
         androidMain.dependencies {
             implementation(libs.androidx.exifinterface)
+            implementation(libs.bouncycastle)
         }
     }
 }

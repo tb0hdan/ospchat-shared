@@ -1,6 +1,7 @@
 package com.ospchat.shared.media
 
 import com.ospchat.shared.net.dto.CallIceDto
+import com.ospchat.shared.turn.IceServerConfig
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -98,7 +99,13 @@ interface AudioCallSession {
  * sessions can be lightweight.
  */
 interface AudioCallSessionFactory {
-    fun create(): AudioCallSession
+    /**
+     * Create a fresh session. [iceServers] is threaded into the underlying
+     * `RTCConfiguration.iceServers`; passing an empty list (the default)
+     * gives the pre-phase-3 behaviour of host-candidates-only LAN calls.
+     * Phase 3 supplies TURN entries fetched via `/v1/call/relay-cred`.
+     */
+    fun create(iceServers: List<IceServerConfig> = emptyList()): AudioCallSession
 }
 
 /**
