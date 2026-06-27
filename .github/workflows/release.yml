@@ -1,20 +1,19 @@
 name: Release
 
-# On tag push (e.g. `v0.1.0`): re-verify ktlint + tests, publish to GitHub
-# Packages Maven repository, and create a GitHub Release with the JAR + AAR
-# attached for direct download.
+# On tag push (e.g. `v0.1.0`): re-verify ktlint + tests and create a GitHub
+# Release with the JAR + AAR attached for direct download. Consumers build this
+# module from source (composite build) or fetch via `publishToMavenLocal`; there
+# is no remote Maven registry.
 on:
   push:
     tags: ['v*']
 
 permissions:
   contents: write
-  # Needed for publishing to GitHub Packages (Maven) below.
-  packages: write
 
 jobs:
   release:
-    name: ktlint + publish + GitHub Release
+    name: ktlint + tests + GitHub Release
     runs-on: ubuntu-latest
 
     steps:
@@ -56,13 +55,6 @@ jobs:
         env:
           GRADLE: gradle
         run: make build
-
-      - name: Publish to GitHub Packages (Maven)
-        env:
-          GRADLE: gradle
-          ORG_GRADLE_PROJECT_gprUser: ${{ github.actor }}
-          ORG_GRADLE_PROJECT_gprToken: ${{ secrets.GITHUB_TOKEN }}
-        run: gradle publish --no-daemon
 
       - name: Collect release artifacts
         # Pull every produced JAR / AAR / module file into a flat dist/

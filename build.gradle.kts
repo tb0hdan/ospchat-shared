@@ -105,26 +105,10 @@ dependencies {
 
 // --- Publishing ---------------------------------------------------------------
 //
-// `publishToMavenLocal` populates ~/.m2/repository for local dev (the desktop
-// app's primary consumption path right now).
-//
-// `publish` pushes to GitHub Packages on tag-push releases. CI sets the two
-// project properties `gprUser` + `gprToken` via env vars matching Gradle's
-// `ORG_GRADLE_PROJECT_*` convention. For local publishing to a real registry
-// you can also set them in `~/.gradle/gradle.properties`.
-publishing {
-    repositories {
-        maven {
-            name = "GitHubPackages"
-            // GITHUB_REPOSITORY is set by GitHub Actions; outside CI we
-            // default to a sensible placeholder so configuration still works
-            // (the repo just won't be reachable for actual publish).
-            val ghRepo = System.getenv("GITHUB_REPOSITORY") ?: "OWNER/ospchat-shared"
-            url = uri("https://maven.pkg.github.com/$ghRepo")
-            credentials {
-                username = (findProperty("gprUser") as String?) ?: System.getenv("GITHUB_ACTOR")
-                password = (findProperty("gprToken") as String?) ?: System.getenv("GITHUB_TOKEN")
-            }
-        }
-    }
-}
+// Local only. `publishToMavenLocal` (a.k.a. `make publish-local`) populates
+// ~/.m2/repository so `ospchat-desktop` can consume the artifact; `ospchat-android`
+// builds this module from source via a Gradle composite build. There is no remote
+// Maven repository — consumers never fetch a prebuilt binary, which also keeps the
+// build reproducible-from-source for F-Droid. The `maven-publish` plugin alone
+// gives the Kotlin Multiplatform publications + the `publishToMavenLocal` task; no
+// `publishing {}` repositories block is needed.
